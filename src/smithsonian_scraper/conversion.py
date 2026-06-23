@@ -42,6 +42,7 @@ from .storage import RecordStore
 
 MAX_CONVERSION_PIXELS = 8_388_608
 DEFAULT_JXL_QUALITY = 95
+MAX_COMMAND_ERROR_OUTPUT = 8000
 METADATA_GROUP_ARGS = (
     "-EXIF:all",
     "-IPTC:all",
@@ -78,6 +79,8 @@ class JxlConverter:
         store: RecordStore,
         max_pixels: int = MAX_CONVERSION_PIXELS,
         quality: int = DEFAULT_JXL_QUALITY,
+        cjxl_verbose: int = 0,
+        skip_metadata: bool = False,
         timeout: float | None = None,
         progress: Callable[[str], None] | None = None,
     ) -> None:
@@ -86,6 +89,8 @@ class JxlConverter:
         self._store = store
         self._max_pixels = max_pixels
         self._quality = quality
+        self._cjxl_verbose = cjxl_verbose
+        self._skip_metadata = skip_metadata
         self._timeout = timeout
         self._progress = progress
 
@@ -103,7 +108,8 @@ class JxlConverter:
         return [str(self._exiftool_path), "-j", "-G1", "-s", *METADATA_GROUP_ARGS, _tool_path(path)]
 
     def encode_command(self, source_path: Path, output_path: Path) -> list[str]:
-        return [str(self._cjxl_path), _tool_path(source_path), _tool_path(output_path), "-q", str(self._quality)]
+        verbose_args = ["-v"] * self._cjxl_verbose
+        return [str(self._cjxl_path), *verbose_args, _tool_path(source_path), _tool_path(output_path), "-q", str(self._quality)]
 
     async def convert_row(self, row: sqlite3.Row) -> tuple[Path, int]:
         source_path = Path(str(row["source_path"]))
@@ -122,25 +128,35 @@ class JxlConverter:
         try:
             started_at = time.monotonic()
             self._log(f"conversion resize start: {source_path}")
-            self._write_resized_tiff(source_path, resized_path)
+            self._write_resized_png(source_path, resized_path)
             self._log(f"conversion resize complete: {resized_path} ({resized_path.stat().st_size} bytes)")
-            self._log(f"conversion metadata copy start: {resized_path}")
-            try:
-                await _run_command(self.metadata_copy_command(source_path, resized_path), timeout=self._timeout)
-            except Exception as exc:
-                raise RuntimeError(f"metadata copy failed for {resized_path}: {exc}") from exc
-            self._log(f"conversion metadata copy complete: {resized_path}")
+            if self._skip_metadata:
+                self._log(f"conversion metadata copy skipped: {resized_path}")
+            else:
+                self._log(f"conversion metadata copy start: {resized_path}")
+                try:
+                    await _run_command(self.metadata_copy_command(source_path, resized_path), timeout=self._timeout)
+                except Exception as exc:
+                    raise RuntimeError(f"metadata copy failed for {resized_path}: {exc}") from exc
+                self._log(f"conversion metadata copy complete: {resized_path}")
             self._log(f"conversion cjxl start: {resized_path} -> {part_path}")
             try:
-                await _run_command(self.encode_command(resized_path, part_path), timeout=self._timeout, cwd=part_path.parent)
+                await _run_command(
+                    self.encode_command(resized_path.resolve(), part_path.resolve()),
+                    timeout=self._timeout,
+                    cwd=part_path.parent.resolve(),
+                )
             except Exception as exc:
                 raise RuntimeError(f"cjxl failed for {resized_path}: {exc}") from exc
             if not part_path.exists() or part_path.stat().st_size == 0:
                 raise RuntimeError("cjxl completed without producing a non-empty JXL")
             self._log(f"conversion cjxl complete: {part_path} ({part_path.stat().st_size} bytes)")
-            self._log(f"conversion metadata verify start: {part_path}")
-            await self._verify_metadata(source_path, part_path)
-            self._log(f"conversion metadata verify complete: {part_path}")
+            if self._skip_metadata:
+                self._log(f"conversion metadata verify skipped: {part_path}")
+            else:
+                self._log(f"conversion metadata verify start: {part_path}")
+                await self._verify_metadata(source_path, part_path)
+                self._log(f"conversion metadata verify complete: {part_path}")
             os.replace(part_path, output_path)
             elapsed = time.monotonic() - started_at
             self._log(f"conversion complete: {output_path} ({output_path.stat().st_size} bytes, {elapsed:.1f}s)")
@@ -152,7 +168,7 @@ class JxlConverter:
         if self._progress is not None:
             self._progress(message)
 
-    def _write_resized_tiff(self, source_path: Path, resized_path: Path) -> None:
+    def _write_resized_png(self, source_path: Path, resized_path: Path) -> None:
         image = cv2.imread(str(source_path), cv2.IMREAD_UNCHANGED)
         if image is None:
             raise RuntimeError(f"OpenCV could not read TIFF: {source_path}")
@@ -162,7 +178,7 @@ class JxlConverter:
             image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
         resized_path.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(resized_path), image):
-            raise RuntimeError(f"OpenCV could not write resized TIFF: {resized_path}")
+            raise RuntimeError(f"OpenCV could not write resized PNG: {resized_path}")
 
     async def _verify_metadata(self, source_path: Path, output_path: Path) -> None:
         source_metadata = await self._selected_metadata(source_path)
@@ -226,11 +242,20 @@ async def _run_command(command: list[str], *, timeout: float | None, cwd: Path |
         raise TimeoutError(f"command timed out after {timeout} seconds: {command[0]}") from exc
 
     if process.returncode != 0:
-        output = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        output = _command_output(stdout, stderr)
         if output:
-            raise RuntimeError(f"{command[0]} failed with exit code {process.returncode}: {output[:1000]}")
+            raise RuntimeError(f"{command[0]} failed with exit code {process.returncode}: {output[:MAX_COMMAND_ERROR_OUTPUT]}")
         raise RuntimeError(f"{command[0]} failed with exit code {process.returncode}")
     return stdout, stderr
+
+
+def _command_output(stdout: bytes, stderr: bytes) -> str:
+    parts = []
+    if stdout:
+        parts.append("stdout:\n" + stdout.decode("utf-8", errors="replace").strip())
+    if stderr:
+        parts.append("stderr:\n" + stderr.decode("utf-8", errors="replace").strip())
+    return "\n".join(part for part in parts if part.strip())
 
 
 def _normalize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -251,7 +276,7 @@ def _tool_path(path: Path) -> str:
 
 
 def _resized_temp_path(source_path: Path) -> Path:
-    return source_path.with_name(f"{source_path.stem}.resized.tmp.tif")
+    return source_path.with_name(f"{source_path.stem}.resized.tmp.png")
 
 
 def _remove_paths(*paths: Path) -> None:

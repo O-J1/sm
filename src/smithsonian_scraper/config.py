@@ -26,6 +26,8 @@ class ScraperConfig:
     conversion_timeout: float | None = None
     conversion_max_pixels: int = 8_388_608
     jxl_quality: int = 95
+    cjxl_verbose: int = 0
+    skip_conversion_metadata: bool = False
     cjxl_path: Path | None = None
     exiftool_path: Path | None = None
     query: str = "*:*"
@@ -57,6 +59,8 @@ class ScraperConfig:
             raise ValueError("conversion_max_pixels must be at least 1")
         if not 1 <= self.jxl_quality <= 100:
             raise ValueError("jxl_quality must be between 1 and 100")
+        if self.cjxl_verbose < 0:
+            raise ValueError("cjxl_verbose cannot be negative")
 
 
 def build_config(
@@ -76,6 +80,8 @@ def build_config(
     conversion_timeout: float | None = None,
     conversion_max_pixels: int | None = None,
     jxl_quality: int | None = None,
+    cjxl_verbose: int | None = None,
+    skip_conversion_metadata: bool = False,
     cjxl_path: str | Path | None = None,
     exiftool_path: str | Path | None = None,
     query: str = "*:*",
@@ -114,6 +120,8 @@ def build_config(
         if conversion_max_pixels is not None
         else _env_int("SMITHSONIAN_CONVERSION_MAX_PIXELS", 8_388_608),
         jxl_quality=jxl_quality if jxl_quality is not None else _env_int("SMITHSONIAN_JXL_QUALITY", 95),
+        cjxl_verbose=cjxl_verbose if cjxl_verbose is not None else _env_int("SMITHSONIAN_CJXL_VERBOSE", 0),
+        skip_conversion_metadata=skip_conversion_metadata,
         cjxl_path=Path(configured_cjxl) if configured_cjxl else None,
         exiftool_path=Path(configured_exiftool) if configured_exiftool else None,
         query=query,

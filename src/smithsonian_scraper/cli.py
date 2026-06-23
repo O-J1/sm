@@ -202,13 +202,16 @@ async def _run_conversion_worker(
         store=RecordStore(config.output_dir),
         max_pixels=config.conversion_max_pixels,
         quality=config.jxl_quality,
+        cjxl_verbose=config.cjxl_verbose,
+        skip_metadata=config.skip_conversion_metadata,
         timeout=config.conversion_timeout,
         progress=_print_progress,
     )
     timeout_text = f"timeout={config.conversion_timeout}s" if config.conversion_timeout is not None else "timeout=none"
     _print_progress(
         f"conversion worker ready: workers={config.conversion_workers}, quality={config.jxl_quality}, "
-        f"max_pixels={config.conversion_max_pixels}, {timeout_text}"
+        f"max_pixels={config.conversion_max_pixels}, cjxl_verbose={config.cjxl_verbose}, "
+        f"skip_metadata={config.skip_conversion_metadata}, {timeout_text}"
     )
     await state.enqueue_pending_tiff_conversions()
     failed_this_run: set[tuple[str, str]] = set()
@@ -287,6 +290,8 @@ def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
         conversion_timeout=args.conversion_timeout,
         conversion_max_pixels=args.conversion_max_pixels,
         jxl_quality=args.jxl_quality,
+        cjxl_verbose=args.cjxl_verbose,
+        skip_conversion_metadata=args.skip_conversion_metadata,
         cjxl_path=args.cjxl_path,
         exiftool_path=args.exiftool_path,
         query=args.query,
@@ -317,6 +322,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conversion-timeout", type=float, default=None)
     parser.add_argument("--conversion-max-pixels", type=int, default=None)
     parser.add_argument("--jxl-quality", type=int, default=None)
+    parser.add_argument("--cjxl-verbose", action="count", default=None, help="Pass -v to cjxl. Repeat for more detail.")
+    parser.add_argument("--skip-conversion-metadata", action="store_true")
     parser.add_argument("--cjxl-path", default=None)
     parser.add_argument("--exiftool-path", default=None)
     parser.add_argument("--query", default="*:*")

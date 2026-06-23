@@ -10,3 +10,8 @@ tests/
 dist/
 build/
 *.md
+*.png
+*.tiff
+*.jpeg
+*.jpg
+*.tif
