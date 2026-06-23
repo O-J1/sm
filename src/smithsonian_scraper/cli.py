@@ -138,11 +138,11 @@ async def _download_media(config: ScraperConfig, existing_state: StateStore | No
                     try:
                         path, size = task.result()
                     except Exception as exc:
-                        await state.mark_media_failed(row["media_key"], str(exc))
+                        await state.mark_media_failed(row["resource_key"], str(exc))
                         continue
-                    await state.mark_media_complete(row["media_key"], path, size)
+                    await state.mark_media_complete(row["resource_key"], path, size)
                     if _is_tiff_conversion_candidate(row, path):
-                        await state.enqueue_media_conversion(row["media_key"], path)
+                        await state.enqueue_media_conversion(row["resource_key"], path)
                         conversion_wake.set()
         except BaseException as exc:
             download_error = exc
@@ -233,28 +233,28 @@ async def _run_conversion_worker(
         results = await asyncio.gather(*(converter.convert_row(row) for row in rows), return_exceptions=True)
         for row, result in zip(rows, results, strict=True):
             if isinstance(result, Exception):
-                media_key = row["media_key"]
+                resource_key = row["resource_key"]
                 target_format = row["target_format"]
                 attempt = int(row["attempts"]) + 1
                 _print_progress(
-                    f"conversion failed: {media_key} ({target_format}) attempt {attempt}/{config.retry_limit}: {result}"
+                    f"conversion failed: {resource_key} ({target_format}) attempt {attempt}/{config.retry_limit}: {result}"
                 )
                 await state.mark_conversion_failed(
-                    media_key,
+                    resource_key,
                     str(result),
                     target_format=target_format,
                 )
                 await state.record_failure(
                     source="jxl-conversion",
-                    identifier=media_key,
+                    identifier=resource_key,
                     payload={"source_path": row["source_path"], "target_format": target_format},
                     error=str(result),
                 )
-                failed_this_run.add((media_key, target_format))
+                failed_this_run.add((resource_key, target_format))
             else:
                 path, size = result
                 await state.mark_conversion_complete(
-                    row["media_key"],
+                    row["resource_key"],
                     path,
                     size,
                     target_format=row["target_format"],

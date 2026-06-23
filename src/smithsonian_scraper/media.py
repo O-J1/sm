@@ -80,9 +80,10 @@ class MediaDownloader:
 
 
 def _media_from_row(row: sqlite3.Row):
-    from .models import MediaAsset
+    from .models import MediaDownload
 
-    return MediaAsset(
+    return MediaDownload(
+        resource_key=str(row["resource_key"]),
         record_id=str(row["record_id"]),
         unit_code=str(row["unit_code"]),
         record_hash=str(row["record_hash"]),

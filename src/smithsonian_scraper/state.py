@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import FreetextEntry, MediaAsset, SmithsonianRecord
+from .models import SmithsonianRecord
+from .normalization import NormalizedRecordProjection
 
 
 @dataclass(frozen=True)
@@ -36,13 +37,32 @@ class StateStore:
     async def initialize(self) -> None:
         async with self._lock:
             self._connection.executescript(SCHEMA)
+            self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
             self._connection.execute("UPDATE pages SET status = 'pending' WHERE status = 'running'")
-            self._connection.execute("UPDATE media_assets SET status = 'pending' WHERE status = 'running'")
-            self._suppress_jpeg_downloads_with_tiff()
+            self._connection.execute("UPDATE media_resources SET status = 'pending' WHERE status = 'running'")
             self._connection.execute("UPDATE media_conversions SET status = 'pending' WHERE status = 'running'")
             self._connection.commit()
+
+    async def upsert_record_projection(
+        self,
+        record: SmithsonianRecord,
+        raw_path: Path,
+        projection: NormalizedRecordProjection,
+    ) -> bool:
+        async with self._lock:
+            existing = self._connection.execute(
+                "SELECT doc_signature FROM records WHERE id = ?",
+                (record.id,),
+            ).fetchone()
+            raw_changed = existing is None or existing["doc_signature"] != record.doc_signature
+            projection_needs_replace = raw_changed or self._projection_needs_replace(record, projection)
+            self._upsert_record_row(record, raw_path)
+            if projection_needs_replace:
+                self._replace_record_projection(record, raw_path, projection)
+            self._connection.commit()
+            return raw_changed
 
     async def upsert_partition(self, partition_key: str, query: str, row_count: int | None) -> None:
         async with self._lock:
@@ -58,31 +78,6 @@ class StateStore:
                 (partition_key, query, row_count),
             )
             self._connection.commit()
-
-    def _suppress_jpeg_downloads_with_tiff(self) -> None:
-        self._connection.execute(
-            """
-            UPDATE media_assets
-            SET downloadable = 0,
-                status = 'metadata',
-                error = 'suppressed because TIFF is available',
-                updated_at = unixepoch()
-            WHERE kind = 'highres_jpeg'
-                AND status != 'complete'
-                AND EXISTS (
-                    SELECT 1
-                    FROM media_assets AS tiff
-                    WHERE tiff.kind = 'highres_tiff'
-                        AND tiff.record_id = media_assets.record_id
-                        AND (
-                            (tiff.media_id != '' AND tiff.media_id = media_assets.media_id)
-                            OR (tiff.ids_id != '' AND tiff.ids_id = media_assets.ids_id)
-                            OR (tiff.guid != '' AND tiff.guid = media_assets.guid)
-                            OR (tiff.parent_media_url != '' AND tiff.parent_media_url = media_assets.parent_media_url)
-                        )
-                )
-            """
-        )
 
     async def page_status(self, partition_key: str, start: int) -> str | None:
         async with self._lock:
@@ -123,194 +118,405 @@ class StateStore:
             )
             self._connection.commit()
 
-    async def upsert_record(self, record: SmithsonianRecord, raw_path: Path) -> bool:
-        async with self._lock:
-            existing = self._connection.execute(
-                "SELECT doc_signature FROM records WHERE id = ?",
+    def _upsert_record_row(self, record: SmithsonianRecord, raw_path: Path) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO records (
+                id, title, unit_code, linked_id, type, url, hash, doc_signature,
+                timestamp, last_time_updated, status, public_search, version, raw_path, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                unit_code = excluded.unit_code,
+                linked_id = excluded.linked_id,
+                type = excluded.type,
+                url = excluded.url,
+                hash = excluded.hash,
+                doc_signature = excluded.doc_signature,
+                timestamp = excluded.timestamp,
+                last_time_updated = excluded.last_time_updated,
+                status = excluded.status,
+                public_search = excluded.public_search,
+                version = excluded.version,
+                raw_path = excluded.raw_path,
+                updated_at = unixepoch()
+            """,
+            (
+                record.id,
+                record.title,
+                record.unit_code,
+                record.linked_id,
+                record.type,
+                record.url,
+                record.hash,
+                record.doc_signature,
+                record.timestamp,
+                record.last_time_updated,
+                record.status,
+                record.public_search,
+                record.version,
+                str(raw_path),
+            ),
+        )
+
+    def _projection_needs_replace(self, record: SmithsonianRecord, projection: NormalizedRecordProjection) -> bool:
+        raw_version = self._connection.execute(
+            "SELECT 1 FROM record_raw_versions WHERE record_id = ? AND doc_signature = ?",
+            (record.id, record.doc_signature),
+        ).fetchone()
+        if raw_version is None:
+            return True
+
+        expected_counts = (
+            ("record_text_entries", len(projection.text_entries)),
+            ("record_identifiers", len(projection.identifiers)),
+            ("record_dates", len(projection.dates)),
+            ("record_rights", len(projection.rights)),
+            ("record_facets", len(projection.facets)),
+            ("record_relationships", len(projection.relationships)),
+            ("media_items", len(projection.media_items)),
+            ("record_media", len(projection.media_items)),
+            ("media_resources", len(projection.media_resources)),
+            ("media_usage_codes", len(projection.media_usage_codes)),
+        )
+        for table, expected in expected_counts:
+            row = self._connection.execute(
+                f"SELECT COUNT(*) AS count FROM {table} WHERE record_id = ?",
                 (record.id,),
             ).fetchone()
-            changed = existing is None or existing["doc_signature"] != record.doc_signature
-            self._connection.execute(
-                """
-                INSERT INTO records (
-                    id, title, unit_code, linked_id, type, url, hash, doc_signature,
-                    timestamp, last_time_updated, status, public_search, version, raw_path, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-                ON CONFLICT(id) DO UPDATE SET
-                    title = excluded.title,
-                    unit_code = excluded.unit_code,
-                    linked_id = excluded.linked_id,
-                    type = excluded.type,
-                    url = excluded.url,
-                    hash = excluded.hash,
-                    doc_signature = excluded.doc_signature,
-                    timestamp = excluded.timestamp,
-                    last_time_updated = excluded.last_time_updated,
-                    status = excluded.status,
-                    public_search = excluded.public_search,
-                    version = excluded.version,
-                    raw_path = excluded.raw_path,
-                    updated_at = unixepoch()
-                """,
-                (
-                    record.id,
-                    record.title,
-                    record.unit_code,
-                    record.linked_id,
-                    record.type,
-                    record.url,
-                    record.hash,
-                    record.doc_signature,
-                    record.timestamp,
-                    record.last_time_updated,
-                    record.status,
-                    record.public_search,
-                    record.version,
-                    str(raw_path),
-                ),
-            )
-            self._connection.commit()
-            return changed
+            if int(row["count"]) != expected:
+                return True
+        return False
 
-    async def enqueue_media(self, media: MediaAsset) -> None:
-        async with self._lock:
-            self._connection.execute(
-                """
-                INSERT INTO media_assets (
-                    media_key, record_id, unit_code, record_hash, kind, media_type, url,
-                    thumbnail, caption, preferred_citation, usage_access, usage_text,
-                    usage_codes_json, usage_flag, guid, media_id, ids_id, alt_text,
-                    extended_description, resource_label, resource_width, resource_height,
-                    resource_dimensions, parent_media_url, screen_url, thumbnail_url,
-                    downloadable, status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-                ON CONFLICT(media_key) DO UPDATE SET
-                    record_id = excluded.record_id,
-                    unit_code = excluded.unit_code,
-                    record_hash = excluded.record_hash,
-                    kind = excluded.kind,
-                    media_type = excluded.media_type,
-                    url = excluded.url,
-                    thumbnail = excluded.thumbnail,
-                    caption = excluded.caption,
-                    preferred_citation = excluded.preferred_citation,
-                    usage_access = excluded.usage_access,
-                    usage_text = excluded.usage_text,
-                    usage_codes_json = excluded.usage_codes_json,
-                    usage_flag = excluded.usage_flag,
-                    guid = excluded.guid,
-                    media_id = excluded.media_id,
-                    ids_id = excluded.ids_id,
-                    alt_text = excluded.alt_text,
-                    extended_description = excluded.extended_description,
-                    resource_label = excluded.resource_label,
-                    resource_width = excluded.resource_width,
-                    resource_height = excluded.resource_height,
-                    resource_dimensions = excluded.resource_dimensions,
-                    parent_media_url = excluded.parent_media_url,
-                    screen_url = excluded.screen_url,
-                    thumbnail_url = excluded.thumbnail_url,
-                    downloadable = excluded.downloadable,
-                    updated_at = unixepoch()
-                """,
+    def _replace_record_projection(
+        self,
+        record: SmithsonianRecord,
+        raw_path: Path,
+        projection: NormalizedRecordProjection,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO record_raw_versions (record_id, doc_signature, unit_code, raw_json, raw_path, scraped_at)
+            VALUES (?, ?, ?, ?, ?, unixepoch())
+            ON CONFLICT(record_id, doc_signature) DO UPDATE SET
+                unit_code = excluded.unit_code,
+                raw_json = excluded.raw_json,
+                raw_path = excluded.raw_path,
+                scraped_at = unixepoch()
+            """,
+            (
+                record.id,
+                record.doc_signature,
+                record.unit_code,
+                json.dumps(record.raw, ensure_ascii=False, separators=(",", ":")),
+                str(raw_path),
+            ),
+        )
+        for table in (
+            "record_text_entries",
+            "record_identifiers",
+            "record_dates",
+            "record_rights",
+            "record_facets",
+            "record_relationships",
+            "media_usage_codes",
+            "media_resources",
+            "record_media",
+            "media_items",
+        ):
+            self._connection.execute(f"DELETE FROM {table} WHERE record_id = ?", (record.id,))
+        self._connection.executemany(
+            """
+            INSERT INTO record_text_entries (
+                record_id, unit_code, category, normalized_category, label, normalized_label,
+                content, content_hash, position, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+            """,
+            [
                 (
-                    media.key,
-                    media.record_id,
-                    media.unit_code,
-                    media.record_hash,
-                    media.kind,
-                    media.media_type,
-                    media.url,
-                    media.thumbnail,
-                    media.caption,
-                    media.preferred_citation,
-                    media.usage_access,
-                    media.usage_text,
-                    json.dumps(media.usage_codes),
-                    media.usage_flag,
-                    media.guid,
-                    media.media_id,
-                    media.ids_id,
-                    media.alt_text,
-                    media.extended_description,
-                    media.resource_label,
-                    media.resource_width,
-                    media.resource_height,
-                    media.resource_dimensions,
-                    media.parent_media_url,
-                    media.screen_url,
-                    media.thumbnail_url,
-                    int(media.downloadable),
-                    "pending" if media.downloadable else "metadata",
-                ),
-            )
-            if media.kind in {"highres_tiff", "highres_jpeg"}:
-                self._suppress_jpeg_downloads_with_tiff()
-            self._connection.commit()
-
-    async def replace_freetext_entries(self, record_id: str, entries: list[FreetextEntry]) -> None:
-        async with self._lock:
-            self._connection.execute("DELETE FROM record_freetext WHERE record_id = ?", (record_id,))
-            self._connection.executemany(
-                """
-                INSERT INTO record_freetext (record_id, unit_code, category, label, content, position, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, unixepoch())
-                """,
-                [
-                    (entry.record_id, entry.unit_code, entry.category, entry.label, entry.content, entry.position)
-                    for entry in entries
-                ],
-            )
-            self._connection.commit()
+                    entry.record_id,
+                    entry.unit_code,
+                    entry.category,
+                    entry.normalized_category,
+                    entry.label,
+                    entry.normalized_label,
+                    entry.content,
+                    entry.content_hash,
+                    entry.position,
+                )
+                for entry in projection.text_entries
+            ],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO record_identifiers (
+                record_id, unit_code, identifier_type, identifier_value, source_category, source_label, position
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    identifier.record_id,
+                    identifier.unit_code,
+                    identifier.identifier_type,
+                    identifier.identifier_value,
+                    identifier.source_category,
+                    identifier.source_label,
+                    identifier.position,
+                )
+                for identifier in projection.identifiers
+            ],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO record_dates (
+                record_id, unit_code, date_text, start_year, end_year, precision, source_category, source_label, position
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    date.record_id,
+                    date.unit_code,
+                    date.date_text,
+                    date.start_year,
+                    date.end_year,
+                    date.precision,
+                    date.source_category,
+                    date.source_label,
+                    date.position,
+                )
+                for date in projection.dates
+            ],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO record_rights (record_id, unit_code, rights_text, normalized_rights, source, source_label, position)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    rights.record_id,
+                    rights.unit_code,
+                    rights.rights_text,
+                    rights.normalized_rights,
+                    rights.source,
+                    rights.source_label,
+                    rights.position,
+                )
+                for rights in projection.rights
+            ],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO record_facets (record_id, unit_code, facet_type, value, normalized_value, source_path, position)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    facet.record_id,
+                    facet.unit_code,
+                    facet.facet_type,
+                    facet.value,
+                    facet.normalized_value,
+                    facet.source_path,
+                    facet.position,
+                )
+                for facet in projection.facets
+            ],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO media_items (
+                media_key, record_id, unit_code, media_type, guid, media_id, ids_id, caption,
+                preferred_citation, usage_access, usage_text, usage_flag, alt_text,
+                extended_description, parent_url, position
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item.media_key,
+                    item.record_id,
+                    item.unit_code,
+                    item.media_type,
+                    item.guid,
+                    item.media_id,
+                    item.ids_id,
+                    item.caption,
+                    item.preferred_citation,
+                    item.usage_access,
+                    item.usage_text,
+                    item.usage_flag,
+                    item.alt_text,
+                    item.extended_description,
+                    item.parent_url,
+                    item.position,
+                )
+                for item in projection.media_items
+            ],
+        )
+        self._connection.executemany(
+            "INSERT INTO record_media (record_id, media_key, position) VALUES (?, ?, ?)",
+            [(item.record_id, item.media_key, item.position) for item in projection.media_items],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO media_resources (
+                resource_key, media_key, record_id, unit_code, role, url, label, width,
+                height, dimensions, downloadable, preferred_download, status, local_path,
+                size_bytes, attempts, error, position, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, 0, '', ?, unixepoch())
+            """,
+            [
+                (
+                    resource.resource_key,
+                    resource.media_key,
+                    resource.record_id,
+                    resource.unit_code,
+                    resource.role,
+                    resource.url,
+                    resource.label,
+                    resource.width,
+                    resource.height,
+                    resource.dimensions,
+                    int(resource.downloadable),
+                    int(resource.preferred_download),
+                    "pending" if resource.downloadable and resource.preferred_download else "metadata",
+                    resource.position,
+                )
+                for resource in projection.media_resources
+            ],
+        )
+        self._connection.executemany(
+            "INSERT INTO media_usage_codes (media_key, record_id, unit_code, code, position) VALUES (?, ?, ?, ?, ?)",
+            [
+                (code.media_key, code.record_id, code.unit_code, code.code, code.position)
+                for code in projection.media_usage_codes
+            ],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO record_relationships (record_id, unit_code, target, relation_type, label, source, position)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    relationship.record_id,
+                    relationship.unit_code,
+                    relationship.target,
+                    relationship.relation_type,
+                    relationship.label,
+                    relationship.source,
+                    relationship.position,
+                )
+                for relationship in projection.relationships
+            ],
+        )
 
     async def next_media_batch(self, limit: int, *, max_attempts: int) -> list[sqlite3.Row]:
         async with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT * FROM media_assets
-                                WHERE downloadable = 1
-                                    AND (status = 'pending'
-                                        OR (status = 'failed' AND attempts < ?))
-                ORDER BY updated_at ASC
+                SELECT
+                    media_resources.resource_key,
+                    media_resources.media_key,
+                    media_resources.record_id,
+                    media_resources.unit_code,
+                    records.hash AS record_hash,
+                    media_resources.role AS kind,
+                    media_items.media_type,
+                    media_resources.url,
+                    COALESCE((
+                        SELECT thumbnail.url
+                        FROM media_resources AS thumbnail
+                        WHERE thumbnail.media_key = media_resources.media_key
+                            AND thumbnail.role = 'thumbnail'
+                        ORDER BY thumbnail.position
+                        LIMIT 1
+                    ), '') AS thumbnail,
+                    media_items.caption,
+                    media_items.preferred_citation,
+                    media_items.usage_access,
+                    media_items.usage_text,
+                    media_items.usage_flag,
+                    media_items.guid,
+                    media_items.media_id,
+                    media_items.ids_id,
+                    media_items.alt_text,
+                    media_items.extended_description,
+                    media_resources.label AS resource_label,
+                    media_resources.width AS resource_width,
+                    media_resources.height AS resource_height,
+                    media_resources.dimensions AS resource_dimensions,
+                    media_items.parent_url AS parent_media_url,
+                    COALESCE((
+                        SELECT screen.url
+                        FROM media_resources AS screen
+                        WHERE screen.media_key = media_resources.media_key
+                            AND screen.role = 'screen'
+                        ORDER BY screen.position
+                        LIMIT 1
+                    ), '') AS screen_url,
+                    COALESCE((
+                        SELECT thumbnail.url
+                        FROM media_resources AS thumbnail
+                        WHERE thumbnail.media_key = media_resources.media_key
+                            AND thumbnail.role = 'thumbnail'
+                        ORDER BY thumbnail.position
+                        LIMIT 1
+                    ), '') AS thumbnail_url,
+                    media_resources.downloadable,
+                    media_resources.status,
+                    media_resources.local_path,
+                    media_resources.size_bytes,
+                    media_resources.attempts,
+                    media_resources.error,
+                    media_resources.updated_at
+                FROM media_resources
+                JOIN media_items ON media_items.media_key = media_resources.media_key
+                JOIN records ON records.id = media_resources.record_id
+                WHERE media_resources.downloadable = 1
+                    AND media_resources.preferred_download = 1
+                    AND (media_resources.status = 'pending'
+                        OR (media_resources.status = 'failed' AND media_resources.attempts < ?))
+                ORDER BY media_resources.updated_at ASC
                 LIMIT ?
                 """,
                 (max_attempts, limit),
             ).fetchall()
             for row in rows:
                 self._connection.execute(
-                    "UPDATE media_assets SET status = 'running', updated_at = unixepoch() WHERE media_key = ?",
-                    (row["media_key"],),
+                    "UPDATE media_resources SET status = 'running', updated_at = unixepoch() WHERE resource_key = ?",
+                    (row["resource_key"],),
                 )
             self._connection.commit()
             return rows
 
-    async def mark_media_complete(self, media_key: str, path: Path, size: int) -> None:
+    async def mark_media_complete(self, resource_key: str, path: Path, size: int) -> None:
         async with self._lock:
             self._connection.execute(
                 """
-                UPDATE media_assets
+                UPDATE media_resources
                 SET status = 'complete', local_path = ?, size_bytes = ?, error = '', updated_at = unixepoch()
-                WHERE media_key = ?
+                WHERE resource_key = ?
                 """,
-                (str(path), size, media_key),
+                (str(path), size, resource_key),
             )
             self._connection.commit()
 
-    async def mark_media_failed(self, media_key: str, error: str) -> None:
+    async def mark_media_failed(self, resource_key: str, error: str) -> None:
         async with self._lock:
             self._connection.execute(
                 """
-                UPDATE media_assets
+                UPDATE media_resources
                 SET status = 'failed', attempts = attempts + 1, error = ?, updated_at = unixepoch()
-                WHERE media_key = ?
+                WHERE resource_key = ?
                 """,
-                (error[:1000], media_key),
+                (error[:1000], resource_key),
             )
             self._connection.commit()
 
     async def enqueue_media_conversion(
         self,
-        media_key: str,
+        resource_key: str,
         source_path: Path,
         *,
         target_format: str = "jxl",
@@ -319,10 +525,10 @@ class StateStore:
             self._connection.execute(
                 """
                 INSERT INTO media_conversions (
-                    media_key, target_format, source_path, output_path, status,
+                    resource_key, target_format, source_path, output_path, status,
                     attempts, error, size_bytes, created_at, updated_at
                 ) VALUES (?, ?, ?, '', 'pending', 0, '', 0, unixepoch(), unixepoch())
-                ON CONFLICT(media_key, target_format) DO UPDATE SET
+                ON CONFLICT(resource_key, target_format) DO UPDATE SET
                     source_path = CASE
                         WHEN media_conversions.status = 'complete' THEN media_conversions.source_path
                         ELSE excluded.source_path
@@ -340,7 +546,7 @@ class StateStore:
                         ELSE unixepoch()
                     END
                 """,
-                (media_key, target_format, str(source_path)),
+                (resource_key, target_format, str(source_path)),
             )
             self._connection.commit()
 
@@ -349,16 +555,16 @@ class StateStore:
             cursor = self._connection.execute(
                 """
                 INSERT INTO media_conversions (
-                    media_key, target_format, source_path, output_path, status,
+                    resource_key, target_format, source_path, output_path, status,
                     attempts, error, size_bytes, created_at, updated_at
                 )
-                SELECT media_key, ?, local_path, '', 'pending', 0, '', 0, unixepoch(), unixepoch()
-                FROM media_assets
+                SELECT resource_key, ?, local_path, '', 'pending', 0, '', 0, unixepoch(), unixepoch()
+                FROM media_resources
                 WHERE status = 'complete'
-                    AND kind = 'highres_tiff'
+                    AND role = 'highres_tiff'
                     AND local_path != ''
                     AND (lower(local_path) LIKE '%.tif' OR lower(local_path) LIKE '%.tiff')
-                ON CONFLICT(media_key, target_format) DO UPDATE SET
+                ON CONFLICT(resource_key, target_format) DO UPDATE SET
                     source_path = CASE
                         WHEN media_conversions.status = 'complete' THEN media_conversions.source_path
                         ELSE excluded.source_path
@@ -386,10 +592,10 @@ class StateStore:
             exclusion_params: list[str] = []
             if excluded_keys:
                 exclusion_clause = " AND " + " AND ".join(
-                    "NOT (media_key = ? AND target_format = ?)" for _ in excluded_keys
+                    "NOT (resource_key = ? AND target_format = ?)" for _ in excluded_keys
                 )
-                for media_key, target_format in sorted(excluded_keys):
-                    exclusion_params.extend([media_key, target_format])
+                for resource_key, target_format in sorted(excluded_keys):
+                    exclusion_params.extend([resource_key, target_format])
             rows = self._connection.execute(
                 f"""
                 SELECT * FROM media_conversions
@@ -406,9 +612,9 @@ class StateStore:
                     """
                     UPDATE media_conversions
                     SET status = 'running', updated_at = unixepoch()
-                    WHERE media_key = ? AND target_format = ?
+                    WHERE resource_key = ? AND target_format = ?
                     """,
-                    (row["media_key"], row["target_format"]),
+                    (row["resource_key"], row["target_format"]),
                 )
             self._connection.commit()
             return rows
@@ -428,7 +634,7 @@ class StateStore:
 
     async def mark_conversion_complete(
         self,
-        media_key: str,
+        resource_key: str,
         output_path: Path,
         size: int,
         *,
@@ -439,21 +645,21 @@ class StateStore:
                 """
                 UPDATE media_conversions
                 SET status = 'complete', output_path = ?, size_bytes = ?, error = '', updated_at = unixepoch()
-                WHERE media_key = ? AND target_format = ?
+                WHERE resource_key = ? AND target_format = ?
                 """,
-                (str(output_path), size, media_key, target_format),
+                (str(output_path), size, resource_key, target_format),
             )
             self._connection.commit()
 
-    async def mark_conversion_failed(self, media_key: str, error: str, *, target_format: str = "jxl") -> None:
+    async def mark_conversion_failed(self, resource_key: str, error: str, *, target_format: str = "jxl") -> None:
         async with self._lock:
             self._connection.execute(
                 """
                 UPDATE media_conversions
                 SET status = 'failed', attempts = attempts + 1, error = ?, updated_at = unixepoch()
-                WHERE media_key = ? AND target_format = ?
+                WHERE resource_key = ? AND target_format = ?
                 """,
-                (error[:1000], media_key, target_format),
+                (error[:1000], resource_key, target_format),
             )
             self._connection.commit()
 
@@ -471,16 +677,16 @@ class StateStore:
     async def status_counts(self) -> dict[str, int]:
         async with self._lock:
             pairs = []
-            for table in ("partitions", "pages", "media_assets", "media_conversions"):
+            for table in ("partitions", "pages", "media_resources", "media_conversions"):
                 rows = self._connection.execute(
                     f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
                 ).fetchall()
                 pairs.extend((f"{table}.{row['status']}", int(row["count"])) for row in rows)
             record_count = self._connection.execute("SELECT COUNT(*) AS count FROM records").fetchone()
             failure_count = self._connection.execute("SELECT COUNT(*) AS count FROM failures").fetchone()
-            freetext_count = self._connection.execute("SELECT COUNT(*) AS count FROM record_freetext").fetchone()
+            text_count = self._connection.execute("SELECT COUNT(*) AS count FROM record_text_entries").fetchone()
             pairs.append(("records.total", int(record_count["count"])))
-            pairs.append(("record_freetext.total", int(freetext_count["count"])))
+            pairs.append(("record_text_entries.total", int(text_count["count"])))
             pairs.append(("failures.total", int(failure_count["count"])))
             return dict(pairs)
 
@@ -532,62 +738,191 @@ CREATE INDEX IF NOT EXISTS idx_records_unit_code ON records(unit_code);
 CREATE INDEX IF NOT EXISTS idx_records_doc_signature ON records(doc_signature);
 CREATE INDEX IF NOT EXISTS idx_records_last_time_updated ON records(last_time_updated);
 
-CREATE TABLE IF NOT EXISTS record_freetext (
+CREATE TABLE IF NOT EXISTS record_raw_versions (
+    record_id TEXT NOT NULL,
+    doc_signature TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    scraped_at INTEGER NOT NULL,
+    PRIMARY KEY (record_id, doc_signature),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_raw_versions_record_id ON record_raw_versions(record_id);
+CREATE INDEX IF NOT EXISTS idx_record_raw_versions_unit_code ON record_raw_versions(unit_code);
+
+CREATE TABLE IF NOT EXISTS record_text_entries (
     record_id TEXT NOT NULL,
     unit_code TEXT NOT NULL,
     category TEXT NOT NULL,
+    normalized_category TEXT NOT NULL,
     label TEXT NOT NULL,
+    normalized_label TEXT NOT NULL,
     content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
     position INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    PRIMARY KEY (record_id, position)
+    PRIMARY KEY (record_id, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_record_freetext_record_id ON record_freetext(record_id);
-CREATE INDEX IF NOT EXISTS idx_record_freetext_category ON record_freetext(category);
-CREATE INDEX IF NOT EXISTS idx_record_freetext_label ON record_freetext(label);
+CREATE INDEX IF NOT EXISTS idx_record_text_entries_category ON record_text_entries(normalized_category);
+CREATE INDEX IF NOT EXISTS idx_record_text_entries_label ON record_text_entries(normalized_label);
+CREATE INDEX IF NOT EXISTS idx_record_text_entries_hash ON record_text_entries(content_hash);
 
-CREATE TABLE IF NOT EXISTS media_assets (
+CREATE TABLE IF NOT EXISTS record_identifiers (
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    identifier_type TEXT NOT NULL,
+    identifier_value TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    source_label TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (record_id, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_identifiers_value ON record_identifiers(identifier_value);
+CREATE INDEX IF NOT EXISTS idx_record_identifiers_type ON record_identifiers(identifier_type);
+
+CREATE TABLE IF NOT EXISTS record_dates (
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    date_text TEXT NOT NULL,
+    start_year INTEGER,
+    end_year INTEGER,
+    precision TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    source_label TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (record_id, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_dates_start_year ON record_dates(start_year);
+CREATE INDEX IF NOT EXISTS idx_record_dates_end_year ON record_dates(end_year);
+
+CREATE TABLE IF NOT EXISTS record_rights (
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    rights_text TEXT NOT NULL,
+    normalized_rights TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_label TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (record_id, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_rights_normalized ON record_rights(normalized_rights);
+
+CREATE TABLE IF NOT EXISTS record_facets (
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    facet_type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (record_id, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_facets_type ON record_facets(facet_type);
+CREATE INDEX IF NOT EXISTS idx_record_facets_value ON record_facets(normalized_value);
+
+CREATE TABLE IF NOT EXISTS media_items (
     media_key TEXT PRIMARY KEY,
     record_id TEXT NOT NULL,
     unit_code TEXT NOT NULL,
-    record_hash TEXT NOT NULL,
-    kind TEXT NOT NULL,
     media_type TEXT NOT NULL,
-    url TEXT NOT NULL,
-    thumbnail TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    media_id TEXT NOT NULL,
+    ids_id TEXT NOT NULL,
     caption TEXT NOT NULL,
     preferred_citation TEXT NOT NULL,
     usage_access TEXT NOT NULL,
     usage_text TEXT NOT NULL,
-    usage_codes_json TEXT NOT NULL,
     usage_flag TEXT NOT NULL,
-    guid TEXT NOT NULL,
-    media_id TEXT NOT NULL,
-    ids_id TEXT NOT NULL,
     alt_text TEXT NOT NULL,
     extended_description TEXT NOT NULL,
-    resource_label TEXT NOT NULL,
-    resource_width INTEGER,
-    resource_height INTEGER,
-    resource_dimensions TEXT NOT NULL,
-    parent_media_url TEXT NOT NULL,
-    screen_url TEXT NOT NULL,
-    thumbnail_url TEXT NOT NULL,
-    downloadable INTEGER NOT NULL DEFAULT 1,
-    status TEXT NOT NULL,
+    parent_url TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_items_record_id ON media_items(record_id);
+CREATE INDEX IF NOT EXISTS idx_media_items_ids_id ON media_items(ids_id);
+CREATE INDEX IF NOT EXISTS idx_media_items_guid ON media_items(guid);
+
+CREATE TABLE IF NOT EXISTS record_media (
+    record_id TEXT NOT NULL,
+    media_key TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (record_id, media_key),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE,
+    FOREIGN KEY (media_key) REFERENCES media_items(media_key) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS media_resources (
+    resource_key TEXT PRIMARY KEY,
+    media_key TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    role TEXT NOT NULL,
+    url TEXT NOT NULL,
+    label TEXT NOT NULL,
+    width INTEGER,
+    height INTEGER,
+    dimensions TEXT NOT NULL,
+    downloadable INTEGER NOT NULL DEFAULT 0 CHECK (downloadable IN (0, 1)),
+    preferred_download INTEGER NOT NULL DEFAULT 0 CHECK (preferred_download IN (0, 1)),
+    status TEXT NOT NULL DEFAULT 'metadata',
     local_path TEXT NOT NULL DEFAULT '',
     size_bytes INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL
+    position INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE,
+    FOREIGN KEY (media_key) REFERENCES media_items(media_key) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_media_status ON media_assets(status);
-CREATE INDEX IF NOT EXISTS idx_media_record_id ON media_assets(record_id);
+CREATE INDEX IF NOT EXISTS idx_media_resources_media_key ON media_resources(media_key);
+CREATE INDEX IF NOT EXISTS idx_media_resources_role ON media_resources(role);
+CREATE INDEX IF NOT EXISTS idx_media_resources_preferred ON media_resources(preferred_download);
+CREATE INDEX IF NOT EXISTS idx_media_resources_status ON media_resources(status);
+
+CREATE TABLE IF NOT EXISTS media_usage_codes (
+    media_key TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    code TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (media_key, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE,
+    FOREIGN KEY (media_key) REFERENCES media_items(media_key) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_usage_codes_code ON media_usage_codes(code);
+
+CREATE TABLE IF NOT EXISTS record_relationships (
+    record_id TEXT NOT NULL,
+    unit_code TEXT NOT NULL,
+    target TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    label TEXT NOT NULL,
+    source TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (record_id, position),
+    FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_relationships_target ON record_relationships(target);
 
 CREATE TABLE IF NOT EXISTS media_conversions (
-    media_key TEXT NOT NULL,
+    resource_key TEXT NOT NULL,
     target_format TEXT NOT NULL DEFAULT 'jxl',
     source_path TEXT NOT NULL,
     output_path TEXT NOT NULL DEFAULT '',
@@ -597,11 +932,12 @@ CREATE TABLE IF NOT EXISTS media_conversions (
     size_bytes INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    PRIMARY KEY (media_key, target_format)
+    PRIMARY KEY (resource_key, target_format),
+    FOREIGN KEY (resource_key) REFERENCES media_resources(resource_key) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_media_conversions_status ON media_conversions(status);
-CREATE INDEX IF NOT EXISTS idx_media_conversions_media_key ON media_conversions(media_key);
+CREATE INDEX IF NOT EXISTS idx_media_conversions_resource_key ON media_conversions(resource_key);
 
 CREATE TABLE IF NOT EXISTS failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

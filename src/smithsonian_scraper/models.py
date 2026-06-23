@@ -30,17 +30,8 @@ class SmithsonianRecord:
 
 
 @dataclass(frozen=True)
-class FreetextEntry:
-    record_id: str
-    unit_code: str
-    category: str
-    label: str
-    content: str
-    position: int
-
-
-@dataclass(frozen=True)
-class MediaAsset:
+class MediaDownload:
+    resource_key: str
     record_id: str
     unit_code: str
     record_hash: str
@@ -70,8 +61,7 @@ class MediaAsset:
 
     @property
     def key(self) -> str:
-        source = "|".join([self.record_id, self.kind, self.guid, self.media_id, self.resource_label, self.url])
-        return hashlib.sha1(source.encode("utf-8")).hexdigest()
+        return self.resource_key
 
 
 def stable_file_stem(value: str, fallback: str = "asset") -> str:

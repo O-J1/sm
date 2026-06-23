@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from .models import MediaAsset, SmithsonianRecord, sha1_text, stable_file_stem
+from .models import MediaDownload, SmithsonianRecord, sha1_text, stable_file_stem
 
 
 class RecordStore:
@@ -26,7 +26,7 @@ class RecordStore:
 
     def media_path(
         self,
-        media: MediaAsset,
+        media: MediaDownload,
         content_type: str = "",
         content_disposition: str = "",
         first_bytes: bytes = b"",
@@ -45,7 +45,7 @@ class RecordStore:
         stem = stable_file_stem(f"{media.record_id}_{media.kind}_{label}_{sha1_text(source)[:12]}")
         return self.output_dir / "media" / unit / hash_prefix / f"{stem}{extension}"
 
-    def media_part_path(self, media: MediaAsset) -> Path:
+    def media_part_path(self, media: MediaDownload) -> Path:
         unit = stable_file_stem(media.unit_code or "UNKNOWN")
         hash_prefix = (media.record_hash or media.key)[:2]
         source = media.url or media.guid

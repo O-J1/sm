@@ -5,7 +5,8 @@ from typing import Any
 
 from .api import SmithsonianAPIError, SmithsonianClient, search_rows
 from .config import ScraperConfig
-from .parser import RecordParseError, extract_freetext_entries, extract_media_assets, parse_record
+from .normalization import normalize_record
+from .parser import RecordParseError, parse_record
 from .state import PageJob, StateStore
 from .storage import RecordStore
 
@@ -154,13 +155,10 @@ class CrawlScheduler:
             try:
                 record = parse_record(raw)
                 raw_path = self._store.record_path(record)
-                changed = await self._state.upsert_record(record, raw_path)
+                projection = normalize_record(record)
+                changed = await self._state.upsert_record_projection(record, raw_path, projection)
                 if changed:
                     self._store.append_record(record)
-                    await self._state.replace_freetext_entries(record.id, extract_freetext_entries(record))
-                if self._config.download_media and changed:
-                    for media in extract_media_assets(record):
-                        await self._state.enqueue_media(media)
             except RecordParseError as exc:
                 await self._state.record_failure(source="record", identifier=str(raw.get("id", "")), payload=raw, error=str(exc))
         status = "complete" if len(rows_to_process) == len(rows) else "partial"
