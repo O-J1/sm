@@ -24,7 +24,10 @@ class ScraperConfig:
     conversion_workers: int = 1
     conversion_backlog_limit: int = 2
     conversion_timeout: float | None = None
-    darktable_cli_path: Path | None = None
+    conversion_max_pixels: int = 8_388_608
+    jxl_quality: int = 95
+    cjxl_path: Path | None = None
+    exiftool_path: Path | None = None
     query: str = "*:*"
     sort: str = "id"
     record_type: str = "edanmdm"
@@ -50,6 +53,10 @@ class ScraperConfig:
             raise ValueError("conversion_backlog_limit must be at least 1")
         if self.conversion_timeout is not None and self.conversion_timeout <= 0:
             raise ValueError("conversion_timeout must be greater than 0 when provided")
+        if self.conversion_max_pixels < 1:
+            raise ValueError("conversion_max_pixels must be at least 1")
+        if not 1 <= self.jxl_quality <= 100:
+            raise ValueError("jxl_quality must be between 1 and 100")
 
 
 def build_config(
@@ -67,7 +74,10 @@ def build_config(
     conversion_workers: int | None = None,
     conversion_backlog_limit: int | None = None,
     conversion_timeout: float | None = None,
-    darktable_cli_path: str | Path | None = None,
+    conversion_max_pixels: int | None = None,
+    jxl_quality: int | None = None,
+    cjxl_path: str | Path | None = None,
+    exiftool_path: str | Path | None = None,
     query: str = "*:*",
     sort: str = "id",
     record_type: str = "edanmdm",
@@ -78,7 +88,8 @@ def build_config(
 ) -> ScraperConfig:
     output_path = Path(output_dir)
     db_path = Path(database_path) if database_path else output_path / "smithsonian_scraper.sqlite3"
-    configured_darktable = darktable_cli_path or os.getenv("DARKTABLE_CLI_PATH") or None
+    configured_cjxl = cjxl_path or os.getenv("CJXL_PATH") or None
+    configured_exiftool = exiftool_path or os.getenv("EXIFTOOL_PATH") or None
     return ScraperConfig(
         api_key=api_key or os.getenv("SMITHSONIAN_API_KEY", ""),
         output_dir=output_path,
@@ -99,7 +110,12 @@ def build_config(
         conversion_timeout=conversion_timeout
         if conversion_timeout is not None
         else _env_float("SMITHSONIAN_CONVERSION_TIMEOUT"),
-        darktable_cli_path=Path(configured_darktable) if configured_darktable else None,
+        conversion_max_pixels=conversion_max_pixels
+        if conversion_max_pixels is not None
+        else _env_int("SMITHSONIAN_CONVERSION_MAX_PIXELS", 8_388_608),
+        jxl_quality=jxl_quality if jxl_quality is not None else _env_int("SMITHSONIAN_JXL_QUALITY", 95),
+        cjxl_path=Path(configured_cjxl) if configured_cjxl else None,
+        exiftool_path=Path(configured_exiftool) if configured_exiftool else None,
         query=query,
         sort=sort,
         record_type=record_type,

@@ -4,11 +4,12 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 from .api import SmithsonianClient
 from .config import ScraperConfig, build_config
-from .conversion import DarktableConverter
+from .conversion import JxlConverter
 from .media import MediaDownloader
 from .scheduler import CrawlScheduler
 from .state import StateStore
@@ -92,7 +93,7 @@ async def _download_media(config: ScraperConfig, existing_state: StateStore | No
     conversion_wake = asyncio.Event()
     downloads_done = asyncio.Event()
     conversion_task = None
-    if config.darktable_cli_path is not None:
+    if _conversion_enabled(config):
         conversion_task = asyncio.create_task(
             _run_conversion_worker(config, state, wake_event=conversion_wake, stop_event=downloads_done)
         )
@@ -172,8 +173,8 @@ async def _download_media(config: ScraperConfig, existing_state: StateStore | No
 
 
 async def _convert_media(config: ScraperConfig, existing_state: StateStore | None = None) -> None:
-    if config.darktable_cli_path is None:
-        raise ValueError("DARKTABLE_CLI_PATH or --darktable-cli-path is required for convert-media")
+    if not _conversion_enabled(config):
+        raise ValueError("CJXL_PATH and EXIFTOOL_PATH, or --cjxl-path and --exiftool-path, are required for convert-media")
 
     state = existing_state or StateStore(config.database_path)
     if existing_state is None:
@@ -192,17 +193,31 @@ async def _run_conversion_worker(
     wake_event: asyncio.Event | None = None,
     stop_event: asyncio.Event | None = None,
 ) -> None:
-    if config.darktable_cli_path is None:
+    if not _conversion_enabled(config):
         return
 
-    converter = DarktableConverter(
-        darktable_cli_path=config.darktable_cli_path,
+    converter = JxlConverter(
+        cjxl_path=config.cjxl_path,
+        exiftool_path=config.exiftool_path,
         store=RecordStore(config.output_dir),
+        max_pixels=config.conversion_max_pixels,
+        quality=config.jxl_quality,
         timeout=config.conversion_timeout,
+        progress=_print_progress,
+    )
+    timeout_text = f"timeout={config.conversion_timeout}s" if config.conversion_timeout is not None else "timeout=none"
+    _print_progress(
+        f"conversion worker ready: workers={config.conversion_workers}, quality={config.jxl_quality}, "
+        f"max_pixels={config.conversion_max_pixels}, {timeout_text}"
     )
     await state.enqueue_pending_tiff_conversions()
+    failed_this_run: set[tuple[str, str]] = set()
     while True:
-        rows = await state.next_conversion_batch(config.conversion_workers, max_attempts=config.retry_limit)
+        rows = await state.next_conversion_batch(
+            config.conversion_workers,
+            max_attempts=config.retry_limit,
+            exclude=failed_this_run,
+        )
         if not rows:
             if stop_event is None or stop_event.is_set():
                 return
@@ -215,17 +230,24 @@ async def _run_conversion_worker(
         results = await asyncio.gather(*(converter.convert_row(row) for row in rows), return_exceptions=True)
         for row, result in zip(rows, results, strict=True):
             if isinstance(result, Exception):
+                media_key = row["media_key"]
+                target_format = row["target_format"]
+                attempt = int(row["attempts"]) + 1
+                _print_progress(
+                    f"conversion failed: {media_key} ({target_format}) attempt {attempt}/{config.retry_limit}: {result}"
+                )
                 await state.mark_conversion_failed(
-                    row["media_key"],
+                    media_key,
                     str(result),
-                    target_format=row["target_format"],
+                    target_format=target_format,
                 )
                 await state.record_failure(
-                    source="darktable-conversion",
-                    identifier=row["media_key"],
-                    payload={"source_path": row["source_path"], "target_format": row["target_format"]},
+                    source="jxl-conversion",
+                    identifier=media_key,
+                    payload={"source_path": row["source_path"], "target_format": target_format},
                     error=str(result),
                 )
+                failed_this_run.add((media_key, target_format))
             else:
                 path, size = result
                 await state.mark_conversion_complete(
@@ -263,7 +285,10 @@ def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
         conversion_workers=args.conversion_workers,
         conversion_backlog_limit=args.conversion_backlog_limit,
         conversion_timeout=args.conversion_timeout,
-        darktable_cli_path=args.darktable_cli_path,
+        conversion_max_pixels=args.conversion_max_pixels,
+        jxl_quality=args.jxl_quality,
+        cjxl_path=args.cjxl_path,
+        exiftool_path=args.exiftool_path,
         query=args.query,
         sort=args.sort,
         record_type=args.record_type,
@@ -290,7 +315,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conversion-workers", type=int, default=None)
     parser.add_argument("--conversion-backlog-limit", type=int, default=None)
     parser.add_argument("--conversion-timeout", type=float, default=None)
-    parser.add_argument("--darktable-cli-path", default=None)
+    parser.add_argument("--conversion-max-pixels", type=int, default=None)
+    parser.add_argument("--jxl-quality", type=int, default=None)
+    parser.add_argument("--cjxl-path", default=None)
+    parser.add_argument("--exiftool-path", default=None)
     parser.add_argument("--query", default="*:*")
     parser.add_argument("--sort", default="id", choices=["id", "newest", "updated", "random"])
     parser.add_argument("--record-type", default="edanmdm")
@@ -314,9 +342,17 @@ def _require_api_key(config: ScraperConfig) -> None:
         raise ValueError("SMITHSONIAN_API_KEY or --api-key is required")
 
 
+def _conversion_enabled(config: ScraperConfig) -> bool:
+    return config.cjxl_path is not None and config.exiftool_path is not None
+
+
 def _delete_source_tiff(source_path: Path) -> None:
     if source_path.suffix.lower() in {".tif", ".tiff"} and source_path.exists():
         source_path.unlink()
+
+
+def _print_progress(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

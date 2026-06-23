@@ -373,17 +373,33 @@ class StateStore:
             self._connection.commit()
             return int(cursor.rowcount)
 
-    async def next_conversion_batch(self, limit: int, *, max_attempts: int) -> list[sqlite3.Row]:
+    async def next_conversion_batch(
+        self,
+        limit: int,
+        *,
+        max_attempts: int,
+        exclude: set[tuple[str, str]] | None = None,
+    ) -> list[sqlite3.Row]:
         async with self._lock:
+            excluded_keys = exclude or set()
+            exclusion_clause = ""
+            exclusion_params: list[str] = []
+            if excluded_keys:
+                exclusion_clause = " AND " + " AND ".join(
+                    "NOT (media_key = ? AND target_format = ?)" for _ in excluded_keys
+                )
+                for media_key, target_format in sorted(excluded_keys):
+                    exclusion_params.extend([media_key, target_format])
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT * FROM media_conversions
-                WHERE status = 'pending'
-                    OR (status = 'failed' AND attempts < ?)
+                WHERE (status = 'pending'
+                    OR (status = 'failed' AND attempts < ?))
+                    {exclusion_clause}
                 ORDER BY updated_at ASC
                 LIMIT ?
                 """,
-                (max_attempts, limit),
+                (max_attempts, *exclusion_params, limit),
             ).fetchall()
             for row in rows:
                 self._connection.execute(

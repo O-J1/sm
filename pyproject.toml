@@ -7,9 +7,11 @@ name = "smithsonian-scraper"
 version = "0.1.0"
 description = "Resumable Smithsonian Open Access metadata and media scraper"
 readme = "Open access documentation.md"
-requires-python = ">=3.13"
+requires-python = "<=3.12.13"
 dependencies = [
     "httpx>=0.28.1",
+    "numpy<2",
+    "opencv-python-headless<4.9.0",
 ]
 
 [project.optional-dependencies]
