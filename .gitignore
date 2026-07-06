@@ -16,3 +16,4 @@ build/
 *.jpg
 *.tif
 *.json
+*.sqlite
