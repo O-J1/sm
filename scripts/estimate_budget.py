@@ -48,9 +48,9 @@ def unit_medians(conn, media_type: str) -> tuple[dict[str, int], dict[str, int]]
     pixels: dict[str, list[int]] = defaultdict(list)
     for unit, px in conn.execute(
         """
-        SELECT mr.unit_code, mr.width * mr.height
-        FROM media_resources mr JOIN media_items mi ON mi.media_key = mr.media_key
-        WHERE mr.preferred_download = 1 AND mi.media_type = ? AND mr.width > 0 AND mr.height > 0
+        SELECT unit_code, resource_width * resource_height
+        FROM media_assets
+        WHERE downloadable = 1 AND media_type = ? AND resource_width > 0 AND resource_height > 0
         """,
         (media_type,),
     ):
@@ -61,9 +61,9 @@ def unit_medians(conn, media_type: str) -> tuple[dict[str, int], dict[str, int]]
     for unit, cnt, records in conn.execute(
         """
         SELECT unit_code, cnt, COUNT(*)
-        FROM (SELECT mi.unit_code, mi.record_id, COUNT(*) AS cnt
-              FROM media_items mi WHERE mi.media_type = ?
-              GROUP BY mi.unit_code, mi.record_id)
+        FROM (SELECT unit_code, record_id, COUNT(*) AS cnt
+              FROM media_assets WHERE media_type = ?
+              GROUP BY unit_code, record_id)
         GROUP BY unit_code, cnt
         """,
         (media_type,),
@@ -75,13 +75,13 @@ def unit_medians(conn, media_type: str) -> tuple[dict[str, int], dict[str, int]]
 
 def iter_record_images(conn, media_type: str, cc0_only: bool):
     """Yield (record_id, unit_code, [rows]) grouped by record, plus a facet lookup."""
-    rights_clause = "AND mi.usage_access = 'CC0'" if cc0_only else ""
+    rights_clause = "AND usage_access = 'CC0'" if cc0_only else ""
     cursor = conn.execute(
         f"""
-        SELECT mr.record_id, mr.unit_code, mi.position, mr.width, mr.height, mr.resource_key, mr.url
-        FROM media_resources mr JOIN media_items mi ON mi.media_key = mr.media_key
-        WHERE mr.preferred_download = 1 AND mi.media_type = ? {rights_clause}
-        ORDER BY mr.record_id, mi.position
+        SELECT record_id, unit_code, rowid, resource_width, resource_height, media_key, url
+        FROM media_assets
+        WHERE downloadable = 1 AND media_type = ? {rights_clause}
+        ORDER BY record_id, rowid
         """,
         (media_type,),
     )
@@ -127,7 +127,7 @@ def main() -> None:
 
     median_px, median_images = unit_medians(conn, args.media_type)
     facets = GroupedCursor(
-        conn.execute("SELECT record_id, value FROM record_facets WHERE facet_type = 'name' ORDER BY record_id")
+        conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
     )
 
     # Per-rank accumulators: [images, native_bytes, capped_bytes, capped_bytes_median_cap, dropped_images]

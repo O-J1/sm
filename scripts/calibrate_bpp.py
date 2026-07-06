@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import shutil
 import subprocess
 import tempfile
@@ -33,11 +34,11 @@ import httpx
 from _common import (
     DEFAULT_JXL_QUALITY,
     MAIN_MAX_PIXELS,
-    MP_BUCKETS,
     SECONDARY_MAX_PIXELS,
     add_common_arguments,
     ensure_dir,
     median,
+    mp_bucket,
     open_db,
 )
 
@@ -50,28 +51,36 @@ USER_AGENT = "smithsonian-subsample/0.1 (dataset curation research; httpx)"
 
 
 def sample_resources(conn, per_stratum: int, max_images: int) -> list[dict]:
-    strata = conn.execute(
-        """
-        SELECT DISTINCT unit_code FROM media_resources WHERE preferred_download = 1 AND width > 0
-        """
-    ).fetchall()
-    bucket_bounds = [(0, 1), (1, 2), (2, 4), (4, 8), (8, 16), (16, 32), (32, 64), (64, 100000)]
+    """Uniform random sampling via rowid probes - avoids full-table scans."""
+    max_rowid = conn.execute("SELECT max(rowid) FROM media_assets").fetchone()[0] or 0
+    if not max_rowid:
+        return []
     samples: list[dict] = []
-    for (unit,) in strata:
-        for (low, high), bucket in zip(bucket_bounds, MP_BUCKETS):
-            rows = conn.execute(
-                """
-                SELECT resource_key, url, width, height, unit_code
-                FROM media_resources
-                WHERE preferred_download = 1 AND unit_code = ?
-                  AND width * height >= ? AND width * height < ?
-                ORDER BY random() LIMIT ?
-                """,
-                (unit, low * 1_000_000, high * 1_000_000, per_stratum),
-            ).fetchall()
-            samples.extend({**dict(row), "bucket": bucket} for row in rows)
-            if len(samples) >= max_images:
-                return samples[:max_images]
+    seen: set[int] = set()
+    quotas: dict[tuple[str, str], int] = {}
+    attempts = 0
+    while len(samples) < max_images and attempts < max_images * 50:
+        attempts += 1
+        row = conn.execute(
+            """
+            SELECT rowid, media_key AS resource_key, url,
+                   resource_width AS width, resource_height AS height, unit_code
+            FROM media_assets
+            WHERE rowid >= ? AND downloadable = 1
+              AND resource_width > 0 AND resource_height > 0
+            ORDER BY rowid LIMIT 1
+            """,
+            (random.randint(1, max_rowid),),
+        ).fetchone()
+        if row is None or row["rowid"] in seen:
+            continue
+        seen.add(row["rowid"])
+        bucket = mp_bucket(row["width"] * row["height"])
+        key = (row["unit_code"], bucket)
+        if quotas.get(key, 0) >= per_stratum:
+            continue
+        quotas[key] = quotas.get(key, 0) + 1
+        samples.append({**dict(row), "bucket": bucket})
     return samples
 
 

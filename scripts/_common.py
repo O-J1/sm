@@ -9,6 +9,7 @@ import argparse
 import csv
 import re
 import sqlite3
+from collections.abc import Sequence
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +87,7 @@ def write_csv(path: Path, header: list[str], rows: list[list]) -> Path:
     return path
 
 
-def median(values: list[int | float]) -> float:
+def median(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)

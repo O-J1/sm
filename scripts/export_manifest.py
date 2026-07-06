@@ -50,7 +50,7 @@ def main() -> None:
     native_bpp, downscaled_bpp = load_bpp(reports / "calibration.json")
     median_px, median_images = unit_medians(conn, args.media_type)
     facets = GroupedCursor(
-        conn.execute("SELECT record_id, value FROM record_facets WHERE facet_type = 'name' ORDER BY record_id")
+        conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
     )
 
     manifest_path = reports / "manifest.jsonl"

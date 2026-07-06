@@ -1,12 +1,12 @@
 """Extract distinct creator names with roles and usage counts.
 
-Reads the `name` facets (indexedStructured.name), recovers the role label
-(Artist / Maker / Sitter / Manufacturer, ...) from the freetext `name`
-entries of the same record, and counts records and images per name.
-Roles matter: NPG portrait *sitters* and NMNH *collectors* appear in the
-name facet and must not later be ranked as artists.
+Reads the freetext `name` entries (record_freetext, category='name'), which
+carry the role label directly (Artist / Maker / Sitter / Manufacturer, ...),
+and counts records and images per name. Roles matter: NPG portrait *sitters*
+and NMNH *collectors* appear among the names and must not later be ranked
+as artists.
 
-Streams three record_id-ordered cursors with a merge-join, so it scales to
+Streams two record_id-ordered cursors with a merge-join, so it scales to
 the full database. Output: reports/names.csv sorted by image count.
 
 Usage:
@@ -52,44 +52,28 @@ def main() -> None:
     conn = open_db(args.db)
     reports = ensure_dir(args.reports_dir)
 
-    facet_cursor = conn.execute(
+    names_cursor = conn.execute(
         """
-        SELECT record_id, unit_code, value
-        FROM record_facets
-        WHERE facet_type = 'name'
-        ORDER BY record_id
+        SELECT record_id, unit_code, content, label
+        FROM record_freetext
+        WHERE category = 'name'
+        ORDER BY record_id, position
         """
-    )
-    roles = GroupedCursor(
-        conn.execute(
-            """
-            SELECT record_id, label, content
-            FROM record_text_entries
-            WHERE normalized_category = 'name'
-            ORDER BY record_id
-            """
-        )
     )
     media_counts = GroupedCursor(
         conn.execute(
-            "SELECT record_id, COUNT(*) FROM media_items GROUP BY record_id ORDER BY record_id"
+            "SELECT record_id, COUNT(*) FROM media_assets GROUP BY record_id ORDER BY record_id"
         )
     )
 
     stats: dict[str, NameStats] = {}
     current_record = None
-    record_roles: dict[str, str] = {}
     record_images = 0
     seen_keys_for_record: set[str] = set()
 
-    for record_id, unit_code, value in facet_cursor:
+    for record_id, unit_code, value, label in names_cursor:
         if record_id != current_record:
             current_record = record_id
-            record_roles = {}
-            for _, label, content in roles.rows_for(record_id):
-                key = name_key(content)
-                if key and key not in record_roles:
-                    record_roles[key] = label or "(unlabeled)"
             media_rows = media_counts.rows_for(record_id)
             record_images = media_rows[0][1] if media_rows else 0
             seen_keys_for_record = set()
@@ -106,7 +90,7 @@ def main() -> None:
         entry.images += record_images
         entry.values[value] += 1
         entry.units[unit_code] += 1
-        entry.roles[record_roles.get(key, "(no freetext role)")] += 1
+        entry.roles[label or "(unlabeled)"] += 1
 
     rows = []
     for key, entry in stats.items():
