@@ -66,8 +66,7 @@ def sample_resources(conn, per_stratum: int, max_images: int) -> list[dict]:
             SELECT rowid, media_key AS resource_key, url,
                    resource_width AS width, resource_height AS height, unit_code
             FROM media_assets
-            WHERE rowid >= ? AND downloadable = 1
-              AND resource_width > 0 AND resource_height > 0
+            WHERE rowid >= ? AND downloadable = 1 AND media_type = 'Images'
             ORDER BY rowid LIMIT 1
             """,
             (random.randint(1, max_rowid),),
@@ -75,7 +74,7 @@ def sample_resources(conn, per_stratum: int, max_images: int) -> list[dict]:
         if row is None or row["rowid"] in seen:
             continue
         seen.add(row["rowid"])
-        bucket = mp_bucket(row["width"] * row["height"])
+        bucket = mp_bucket(row["width"] * row["height"]) if row["width"] and row["height"] else "unknown"
         key = (row["unit_code"], bucket)
         if quotas.get(key, 0) >= per_stratum:
             continue
@@ -130,7 +129,8 @@ def probe_ids(client: httpx.Client, samples: list[dict], work_dir: Path, limit: 
                 image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
                 if image is not None:
                     entry["returned_height"], entry["returned_width"] = image.shape[:2]
-                    entry["honored"] = max(image.shape[:2]) <= 3000 < max(sample["width"], sample["height"])
+                    if sample["width"] and sample["height"]:
+                        entry["honored"] = max(image.shape[:2]) <= 3000 < max(sample["width"], sample["height"])
         results.append(entry)
     return results
 
@@ -173,6 +173,7 @@ def main() -> None:
     main_bpp: list[float] = []
     secondary_bpp: list[float] = []
     per_unit: dict[str, list[float]] = defaultdict(list)
+    per_unit_px: dict[str, list[int]] = defaultdict(list)
 
     with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=120.0, follow_redirects=True) as client:
         for index, sample in enumerate(samples, 1):
@@ -183,8 +184,11 @@ def main() -> None:
             image = cv2.imread(str(source), cv2.IMREAD_UNCHANGED) if cv2 is not None else None
             if image is not None:
                 pixels = image.shape[0] * image.shape[1]
-            else:
+                per_unit_px[sample["unit_code"]].append(pixels)
+            elif sample["width"] and sample["height"]:
                 pixels = sample["width"] * sample["height"]
+            else:
+                pixels = 0
             if jxl_size and pixels:
                 bpp = jxl_size / pixels
                 native_bpp.append(bpp)
@@ -217,11 +221,14 @@ def main() -> None:
         "main_cap_bpp": stats(main_bpp),
         "secondary_cap_bpp": stats(secondary_bpp),
         "per_unit_native_median": {unit: round(median(values), 4) for unit, values in sorted(per_unit.items())},
+        "per_unit_measured_mp_median": {
+            unit: round(median(values) / 1e6, 3) for unit, values in sorted(per_unit_px.items())
+        },
         "ids_probe": ids_results,
     }
     path = reports / "calibration.json"
     path.write_text(json.dumps(calibration, indent=2), encoding="utf-8")
-    print(json.dumps({k: v for k, v in calibration.items() if k != "per_unit_native_median"}, indent=2))
+    print(json.dumps({k: v for k, v in calibration.items() if not k.startswith("per_unit")}, indent=2))
     print(f"output: {path}")
     if not args.keep_files and args.work_dir is None:
         shutil.rmtree(work_dir, ignore_errors=True)

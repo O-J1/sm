@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -41,6 +42,19 @@ from _common import (
 )
 
 UNRANKED = 1 << 30
+
+
+def load_measured_px(calibration_path: Path) -> dict[str, int]:
+    """Per-unit median pixels measured from downloaded samples (calibrate_bpp.py),
+    the dimensions fallback for units whose metadata lacks width/height."""
+    if not calibration_path.exists():
+        return {}
+    data = json.loads(calibration_path.read_text(encoding="utf-8"))
+    return {
+        unit: int(mp * 1e6)
+        for unit, mp in (data.get("per_unit_measured_mp_median") or {}).items()
+        if mp
+    }
 
 
 def unit_medians(conn, media_type: str) -> tuple[dict[str, int], dict[str, int]]:
@@ -126,6 +140,8 @@ def main() -> None:
           f"({'calibrated' if (reports / 'calibration.json').exists() else 'FALLBACK - run calibrate_bpp.py'})")
 
     median_px, median_images = unit_medians(conn, args.media_type)
+    for unit, px in load_measured_px(reports / "calibration.json").items():
+        median_px.setdefault(unit, px)
     facets = GroupedCursor(
         conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
     )

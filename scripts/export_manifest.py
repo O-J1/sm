@@ -30,7 +30,7 @@ from _common import (
     load_rank_map,
     open_db,
 )
-from estimate_budget import UNRANKED, iter_record_images, record_rank, unit_medians
+from estimate_budget import UNRANKED, iter_record_images, load_measured_px, record_rank, unit_medians
 
 
 def main() -> None:
@@ -49,6 +49,8 @@ def main() -> None:
     rank_map = load_rank_map(reports / "artist_rankings.csv")
     native_bpp, downscaled_bpp = load_bpp(reports / "calibration.json")
     median_px, median_images = unit_medians(conn, args.media_type)
+    for unit, px in load_measured_px(reports / "calibration.json").items():
+        median_px.setdefault(unit, px)
     facets = GroupedCursor(
         conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
     )
