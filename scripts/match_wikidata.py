@@ -53,6 +53,16 @@ ARTIST_OCCUPATIONS = {
 
 DEFAULT_SEED_FILE = REPO_ROOT / "scripts" / "data" / "seed_artists.txt"
 
+# Only names whose top_role contains one of these fragments are sent to the
+# API. The freetext `name` category is dominated by NMNH biogeography,
+# collectors and localities that can never be artists; this keeps the API
+# budget for plausible creators. Case-insensitive substring match.
+DEFAULT_INCLUDE_ROLES = (
+    "artist,maker,manufacturer,designer,engraver,etcher,photographer,painter,"
+    "printmaker,lithographer,sculptor,illustrator,draftsman,drawn,attributed,after,"
+    "architect,cartoonist,calligrapher,potter,weaver,silversmith,goldsmith,carver"
+)
+
 
 class LookupCache:
     def __init__(self, path: Path) -> None:
@@ -80,6 +90,12 @@ def _api_get(client: httpx.Client, params: dict, retries: int = 5) -> dict:
         try:
             response = client.get(API_URL, params=params)
             if response.status_code in (429, 500, 502, 503):
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and attempt < retries:
+                    try:
+                        time.sleep(min(float(retry_after), 60.0))
+                    except ValueError:
+                        pass
                 raise httpx.HTTPStatusError("retryable", request=response.request, response=response)
             response.raise_for_status()
             return response.json()
@@ -129,6 +145,7 @@ def resolve_name(client: httpx.Client, name: str, sleep: float) -> dict:
     time.sleep(sleep)
 
     best: dict | None = None
+    best_sitelinks = -1
     for qid in candidate_ids:
         entity = entities.get("entities", {}).get(qid) or {}
         if HUMAN_QID not in _claim_ids(entity, "P31"):
@@ -137,14 +154,14 @@ def resolve_name(client: httpx.Client, name: str, sleep: float) -> dict:
         if not occupations:
             continue
         sitelinks = len(entity.get("sitelinks", {}))
-        candidate = {
-            "qid": qid,
-            "label": entity.get("labels", {}).get("en", {}).get("value", ""),
-            "sitelinks": sitelinks,
-            "occupations": sorted(ARTIST_OCCUPATIONS[o] for o in occupations),
-        }
-        if best is None or sitelinks > best["sitelinks"]:
-            best = candidate
+        if best is None or sitelinks > best_sitelinks:
+            best_sitelinks = sitelinks
+            best = {
+                "qid": qid,
+                "label": entity.get("labels", {}).get("en", {}).get("value", ""),
+                "sitelinks": sitelinks,
+                "occupations": sorted(ARTIST_OCCUPATIONS[o] for o in occupations),
+            }
     return best or {"qid": None}
 
 
@@ -175,7 +192,12 @@ def main() -> None:
     parser.add_argument("--max-names", type=int, default=5000, help="Look up at most N database names (by image count).")
     parser.add_argument("--min-images", type=int, default=1, help="Skip names attached to fewer images.")
     parser.add_argument("--min-records", type=int, default=1)
-    parser.add_argument("--sleep", type=float, default=0.15, help="Delay between API calls.")
+    parser.add_argument("--sleep", type=float, default=0.4, help="Delay between API calls.")
+    parser.add_argument(
+        "--include-roles",
+        default=DEFAULT_INCLUDE_ROLES,
+        help="Comma-separated substrings; only names whose top_role matches one are looked up. Use '' to disable.",
+    )
     parser.add_argument("--exclude-roles", default="Sitter", help="Comma-separated top_role values to skip (still matched if seeded).")
     args = parser.parse_args()
 
@@ -187,6 +209,7 @@ def main() -> None:
     seeds = load_seed_names(args.seed_file)
     names = load_names_csv(args.names_csv)
     excluded_roles = {role.strip().casefold() for role in args.exclude_roles.split(",") if role.strip()}
+    included_fragments = [frag.strip().casefold() for frag in args.include_roles.split(",") if frag.strip()]
 
     by_key: dict[str, dict] = {}
     for row in names:
@@ -201,7 +224,10 @@ def main() -> None:
             continue
         if int(row["image_count"]) < args.min_images or int(row["record_count"]) < args.min_records:
             continue
-        if row["top_role"].casefold() in excluded_roles:
+        top_role = row["top_role"].casefold()
+        if top_role in excluded_roles:
+            continue
+        if included_fragments and not any(fragment in top_role for fragment in included_fragments):
             continue
         if db_candidates >= args.max_names:
             break
@@ -223,11 +249,15 @@ def main() -> None:
                 print(f"  {index}/{len(pending)} looked up")
 
     rows = []
+    matched_db = 0
     for key, name in queue:
         result = cache.get(key)
         if not result or not result.get("qid"):
             continue
         db_row = by_key.get(key, {})
+        record_count = int(db_row.get("record_count", 0) or 0)
+        if record_count > 0:
+            matched_db += 1
         rows.append(
             [
                 db_row.get("name") or display_form(name),
@@ -237,7 +267,7 @@ def main() -> None:
                 result.get("sitelinks", 0),
                 ";".join(result.get("occupations", [])),
                 1 if key in seeds else 0,
-                int(db_row.get("record_count", 0) or 0),
+                record_count,
                 int(db_row.get("image_count", 0) or 0),
             ]
         )
@@ -248,7 +278,6 @@ def main() -> None:
         ["name", "name_key", "qid", "wikidata_label", "sitelinks", "occupations", "is_seed", "record_count", "image_count"],
         rows,
     )
-    matched_db = sum(1 for row in rows if row[7] > 0)
     print(f"ranked artists: {len(rows):,} ({matched_db:,} present in database)")
     print(f"output: {path}")
 
