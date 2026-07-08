@@ -47,7 +47,7 @@ try:
 except Exception:
     cv2 = None
 
-USER_AGENT = "smithsonian-subsample/0.1 (dataset curation research; httpx)"
+USER_AGENT = "smithsonian-subsampling"
 
 
 def sample_resources(conn, per_stratum: int, max_images: int) -> list[dict]:

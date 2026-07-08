@@ -240,6 +240,12 @@ def main() -> None:
     action = "would insert" if args.dry_run else "inserted"
     print(f"\n{action} {total_media:,} media rows in {(time.time() - started) / 60:.1f} min")
 
+    # Restore rollback journaling; a WAL database cannot reliably be opened
+    # read-only (mode=ro) by the analysis scripts.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.close()
+
 
 if __name__ == "__main__":
     main()
