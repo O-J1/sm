@@ -61,9 +61,20 @@ def display_form(raw: str) -> str:
 
 
 def open_db(path: Path) -> sqlite3.Connection:
-    if not path.exists():
+    # Path("") silently becomes "." - catch empty --db (e.g. unset $db) early.
+    if str(path) in ("", ".") or path.is_dir():
+        raise SystemExit(f"--db must point to a sqlite database file, got: {path!r} (is your $db variable set?)")
+    if not path.is_file():
         raise SystemExit(f"database not found: {path}")
-    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    except sqlite3.OperationalError as error:
+        # WAL databases and some filesystems reject read-only opens
+        # (shm/locking). Fall back to a normal open; scripts only read.
+        print(f"warning: read-only open failed ({error}); opening read-write instead")
+        conn = sqlite3.connect(path)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
     conn.row_factory = sqlite3.Row
     return conn
 
