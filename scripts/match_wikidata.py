@@ -24,7 +24,16 @@ from pathlib import Path
 
 import httpx
 
-from _common import DEFAULT_REPORTS, REPO_ROOT, add_common_arguments, display_form, ensure_dir, name_key, write_csv
+from _common import (
+    ARTIST_ROLE_FRAGMENTS,
+    DEFAULT_REPORTS,
+    REPO_ROOT,
+    add_common_arguments,
+    display_form,
+    ensure_dir,
+    name_key,
+    write_csv,
+)
 
 API_URL = "https://www.wikidata.org/w/api.php"
 USER_AGENT = "smithsonian-subsample/0.1 (dataset curation research; httpx)"
@@ -57,11 +66,7 @@ DEFAULT_SEED_FILE = REPO_ROOT / "scripts" / "data" / "seed_artists.txt"
 # API. The freetext `name` category is dominated by NMNH biogeography,
 # collectors and localities that can never be artists; this keeps the API
 # budget for plausible creators. Case-insensitive substring match.
-DEFAULT_INCLUDE_ROLES = (
-    "artist,maker,manufacturer,designer,engraver,etcher,photographer,painter,"
-    "printmaker,lithographer,sculptor,illustrator,draftsman,drawn,attributed,after,"
-    "architect,cartoonist,calligrapher,potter,weaver,silversmith,goldsmith,carver"
-)
+DEFAULT_INCLUDE_ROLES = ",".join(ARTIST_ROLE_FRAGMENTS)
 
 
 class LookupCache:

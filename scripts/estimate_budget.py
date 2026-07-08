@@ -37,6 +37,7 @@ from _common import (
     add_common_arguments,
     add_policy_arguments,
     derivative_pixels,
+    is_artist_role,
     load_bpp,
     load_derivative_bpp,
     load_rank_map,
@@ -104,13 +105,18 @@ def iter_record_images(conn, media_type: str, cc0_only: bool):
         yield group_key, group[0][1], group
 
 
-def record_rank(facets: GroupedCursor, record_id: str, rank_map: dict[str, int]) -> int:
+def record_rank(facets: GroupedCursor, record_id: str, rank_map: dict[str, int]) -> tuple[int, bool]:
+    """Best artist rank for the record plus whether any of its names carries
+    an artist-type role label (drives the --artist-cap-mp raise)."""
     best = UNRANKED
-    for _, value in facets.rows_for(record_id):
+    has_artist = False
+    for _, value, label in facets.rows_for(record_id):
         rank = rank_map.get(name_key(value), UNRANKED)
         if rank < best:
             best = rank
-    return best
+        if not has_artist and is_artist_role(label):
+            has_artist = True
+    return best, has_artist or best != UNRANKED
 
 
 @dataclass
@@ -158,14 +164,16 @@ def main() -> None:
     for unit, px in load_measured_px(calibration_path).items():
         median_px.setdefault(unit, px)
     facets = GroupedCursor(
-        conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
+        conn.execute(
+            "SELECT record_id, content, label FROM record_freetext WHERE category = 'name' ORDER BY record_id"
+        )
     )
 
     buckets: dict[int, RankBucket] = defaultdict(RankBucket)
     total_images = 0
 
     for record_id, unit_code, images in iter_record_images(conn, args.media_type, args.cc0_only):
-        rank = record_rank(facets, record_id, rank_map)
+        rank, is_artist = record_rank(facets, record_id, rank_map)
         bucket = buckets[rank]
         for index, (_, _, _, width, height, _, _) in enumerate(images):
             px = width * height if width and height else median_px.get(unit_code, 4_000_000)
@@ -179,7 +187,9 @@ def main() -> None:
                 bucket.full_kept += 1
 
             # Outcome if it does not.
-            decision = policy.classify(unit_code=unit_code, index=index, pixels=px, is_top_artist=False)
+            decision = policy.classify(
+                unit_code=unit_code, index=index, pixels=px, is_top_artist=False, is_artist=is_artist
+            )
             if decision.tier == "drop":
                 if decision.drop_reason == "low_quality":
                     bucket.drop_low += 1

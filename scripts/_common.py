@@ -24,6 +24,9 @@ DEFAULT_REPORTS = REPO_ROOT / "reports"
 #   main      - a record's main image (first media item) capped at 8,388,608 px
 #               (NMNHBOTANY: 4,194,304 px).
 #   secondary - additional views capped at 2,097,152 px.
+#   artist cap - optional (--artist-cap-mp): records with an artist-role name
+#               that miss the top-N cut get their main/secondary caps raised
+#               to this value (never lowered). Specimen records are unaffected.
 #   drop      - images below 1MP (low quality), and NMNHBOTANY views beyond the
 #               first 10 of a specimen record.
 # Derivative outputs: kept non-full images whose native size is at least 4x
@@ -72,6 +75,7 @@ class SubsamplePolicy:
     quality: int = DEFAULT_JXL_QUALITY
     main_max_pixels: int = MAIN_MAX_PIXELS
     secondary_max_pixels: int = SECONDARY_MAX_PIXELS
+    artist_max_pixels: int | None = None
     low_quality_min_pixels: int = LOW_QUALITY_MIN_PIXELS
     unit_main_max_pixels: dict[str, int] = field(
         default_factory=lambda: {BOTANY_UNIT: BOTANY_MAIN_MAX_PIXELS}
@@ -84,9 +88,13 @@ class SubsamplePolicy:
     derivative_format: str = DEFAULT_DERIVATIVE_FORMAT
     derivative_quality: int = DEFAULT_DERIVATIVE_QUALITY
 
-    def classify(self, *, unit_code: str, index: int, pixels: int, is_top_artist: bool) -> ImageDecision:
+    def classify(
+        self, *, unit_code: str, index: int, pixels: int, is_top_artist: bool, is_artist: bool = False
+    ) -> ImageDecision:
         """Classify one image of a record. `index` is the record-local media
-        position (0 = main image); `pixels` the native (or estimated) size."""
+        position (0 = main image); `pixels` the native (or estimated) size.
+        `is_artist` marks records with an artist-role creator name that did
+        not make the top-N cut (eligible for the raised artist cap)."""
         if pixels < self.low_quality_min_pixels:
             # Applies to top artists too: sub-1MP files are thumbnails/junk.
             return ImageDecision("drop", drop_reason="low_quality")
@@ -101,6 +109,9 @@ class SubsamplePolicy:
         else:
             tier = "secondary"
             cap = self.secondary_max_pixels
+        if is_artist and self.artist_max_pixels:
+            # Raise (never lower) the cap for unranked/below-cutoff artists.
+            cap = max(cap, self.artist_max_pixels)
         edges = self.derivative_edges if pixels >= cap * self.derivative_min_reduction else ()
         return ImageDecision(tier, target_max_pixels=cap, derivative_edges=tuple(edges))
 
@@ -124,6 +135,9 @@ def add_policy_arguments(parser: argparse.ArgumentParser) -> None:
                        help="Pixel cap (MP) for main images.")
     group.add_argument("--secondary-cap-mp", type=float, default=SECONDARY_MAX_PIXELS / 1e6,
                        help="Pixel cap (MP) for additional views.")
+    group.add_argument("--artist-cap-mp", type=float, default=0.0,
+                       help="Raise main/secondary caps to this many MP for records with an "
+                            "artist-role name that miss the top-N cut (0 = disabled).")
     group.add_argument("--botany-main-cap-mp", type=float, default=BOTANY_MAIN_MAX_PIXELS / 1e6,
                        help="Pixel cap (MP) for NMNHBOTANY main images.")
     group.add_argument("--botany-max-images", type=int, default=BOTANY_MAX_IMAGES_PER_RECORD,
@@ -143,6 +157,7 @@ def policy_from_args(args: argparse.Namespace) -> SubsamplePolicy:
         quality=args.quality,
         main_max_pixels=int(args.main_cap_mp * 1e6),
         secondary_max_pixels=int(args.secondary_cap_mp * 1e6),
+        artist_max_pixels=int(args.artist_cap_mp * 1e6) if args.artist_cap_mp > 0 else None,
         low_quality_min_pixels=int(args.low_quality_min_mp * 1e6),
         unit_main_max_pixels={BOTANY_UNIT: int(args.botany_main_cap_mp * 1e6)},
         unit_max_images=unit_max_images,
@@ -151,6 +166,26 @@ def policy_from_args(args: argparse.Namespace) -> SubsamplePolicy:
         derivative_format=args.derivative_format,
         derivative_quality=args.derivative_quality,
     )
+
+# Role labels marking a name as a plausible creator/artist (case-insensitive
+# substring match). Shared by match_wikidata.py (API candidate filter) and the
+# budget/manifest scripts (--artist-cap-mp eligibility).
+ARTIST_ROLE_FRAGMENTS = (
+    "artist", "maker", "manufacturer", "designer", "engraver", "etcher",
+    "photographer", "painter", "printmaker", "lithographer", "sculptor",
+    "illustrator", "draftsman", "drawn", "attributed", "after", "architect",
+    "cartoonist", "calligrapher", "potter", "weaver", "silversmith",
+    "goldsmith", "carver",
+)
+
+
+def is_artist_role(label: str | None) -> bool:
+    """True when a record_freetext name label looks like a creator role."""
+    if not label:
+        return False
+    lowered = label.casefold()
+    return any(fragment in lowered for fragment in ARTIST_ROLE_FRAGMENTS)
+
 
 _PAREN_RE = re.compile(r"\([^)]*\)")
 _YEAR_SUFFIX_RE = re.compile(

@@ -81,7 +81,9 @@ def main() -> None:
     for unit, px in load_measured_px(calibration_path).items():
         median_px.setdefault(unit, px)
     facets = GroupedCursor(
-        conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
+        conn.execute(
+            "SELECT record_id, content, label FROM record_freetext WHERE category = 'name' ORDER BY record_id"
+        )
     )
 
     manifest_path = reports / "manifest.jsonl"
@@ -94,12 +96,12 @@ def main() -> None:
 
     with manifest_path.open("w", encoding="utf-8") as handle:
         for record_id, unit_code, images in iter_record_images(conn, args.media_type, args.cc0_only):
-            rank = record_rank(facets, record_id, rank_map)
+            rank, is_artist = record_rank(facets, record_id, rank_map)
             is_top_artist = rank < args.top_n
             for index, (_, _, _, width, height, resource_key, url) in enumerate(images):
                 px = width * height if width and height else median_px.get(unit_code, 4_000_000)
                 decision = policy.classify(
-                    unit_code=unit_code, index=index, pixels=px, is_top_artist=is_top_artist
+                    unit_code=unit_code, index=index, pixels=px, is_top_artist=is_top_artist, is_artist=is_artist
                 )
                 common = {
                     "resource_key": resource_key,
