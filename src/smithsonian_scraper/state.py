@@ -36,6 +36,7 @@ class StateStore:
 
     async def initialize(self) -> None:
         async with self._lock:
+            self._migrate_legacy_media_conversions()
             self._connection.executescript(SCHEMA)
             self._ensure_conversion_policy_columns()
             self._connection.execute("PRAGMA foreign_keys=ON")
@@ -45,6 +46,29 @@ class StateStore:
             self._connection.execute("UPDATE media_resources SET status = 'pending' WHERE status = 'running'")
             self._connection.execute("UPDATE media_conversions SET status = 'pending' WHERE status = 'running'")
             self._connection.commit()
+
+    def _migrate_legacy_media_conversions(self) -> None:
+        """Migrate pre-warehouse databases whose media_conversions table was
+        keyed by media_key. The new schema keys conversion work by
+        resource_key, so the legacy table (and its indexes) must move out of
+        the way before the schema script creates the new table."""
+        table = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'media_conversions'"
+        ).fetchone()
+        if table is None:
+            return
+        columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(media_conversions)")}
+        if "resource_key" in columns:
+            return
+        self._connection.execute("DROP INDEX IF EXISTS idx_media_conversions_status")
+        self._connection.execute("DROP INDEX IF EXISTS idx_media_conversions_media_key")
+        count = self._connection.execute("SELECT COUNT(*) AS count FROM media_conversions").fetchone()
+        if int(count["count"]) == 0:
+            self._connection.execute("DROP TABLE media_conversions")
+        else:
+            self._connection.execute("DROP TABLE IF EXISTS media_conversions_legacy")
+            self._connection.execute("ALTER TABLE media_conversions RENAME TO media_conversions_legacy")
+        self._connection.commit()
 
     def _ensure_conversion_policy_columns(self) -> None:
         """Migrate pre-policy databases: add per-output policy columns."""

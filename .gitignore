@@ -18,3 +18,4 @@ build/
 *.json
 *.sqlite3
 *.csv
+*.xml

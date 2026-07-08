@@ -11,6 +11,8 @@ from .api import SmithsonianClient
 from .config import ScraperConfig, build_config
 from .conversion import JxlConverter
 from .media import MediaDownloader
+from .normalization import normalize_record
+from .parser import RecordParseError, parse_record
 from .reporting import write_failure_report
 from .scheduler import CrawlScheduler
 from .state import StateStore
@@ -32,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
             asyncio.run(_convert_media(config, manifest_path=_manifest_path(args)))
         elif args.command == "apply-manifest":
             asyncio.run(_apply_manifest(config, _manifest_path(args, required=True)))
+        elif args.command == "reproject":
+            asyncio.run(_reproject(config))
         elif args.command == "status":
             asyncio.run(_status(config))
         elif args.command == "failure-report":
@@ -297,6 +301,64 @@ async def _run_conversion_worker(
                     _delete_source_tiff(Path(source_path))
 
 
+async def _reproject(config: ScraperConfig) -> None:
+    """Rebuild the normalized projection tables (media_items, media_resources,
+    record_text_entries, ...) from the raw metadata JSONL files on disk.
+    Use this to upgrade a metadata-only database created by an older version
+    of the scraper without re-hitting the API."""
+    state = StateStore(config.database_path)
+    await state.initialize()
+    store = RecordStore(config.output_dir)
+    paths = _metadata_jsonl_paths(config)
+    if not paths:
+        raise ValueError(f"no records.jsonl files found under {config.output_dir / 'metadata'}")
+    processed = 0
+    failed = 0
+    try:
+        for jsonl_path in paths:
+            _print_progress(f"reprojecting {jsonl_path}")
+            with jsonl_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    raw = json.loads(line)
+                    try:
+                        record = parse_record(raw)
+                        projection = normalize_record(record)
+                        await state.upsert_record_projection(record, store.record_path(record), projection)
+                    except RecordParseError as exc:
+                        failed += 1
+                        await state.record_failure(
+                            source="reproject",
+                            identifier=str(raw.get("id", "")),
+                            payload=raw,
+                            error=str(exc),
+                        )
+                        continue
+                    processed += 1
+                    if processed % 10_000 == 0:
+                        _print_progress(f"reprojected {processed:,} records")
+        _print_progress(f"reproject complete: {processed:,} records, {failed:,} failures")
+        print(json.dumps(await state.status_counts(), indent=2, sort_keys=True))
+    finally:
+        await state.close()
+
+
+def _metadata_jsonl_paths(config: ScraperConfig) -> list[Path]:
+    include = {unit.upper() for unit in config.include_units}
+    exclude = {unit.upper() for unit in config.exclude_units}
+    paths = []
+    for path in sorted((config.output_dir / "metadata").glob("*/records.jsonl")):
+        unit = path.parent.name.upper()
+        if include and unit not in include:
+            continue
+        if unit in exclude:
+            continue
+        paths.append(path)
+    return paths
+
+
 async def _status(config: ScraperConfig) -> None:
     state = StateStore(config.database_path)
     await state.initialize()
@@ -352,7 +414,7 @@ def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="smithsonian-scraper")
-    parser.add_argument("command", choices=["probe", "scrape", "resume", "download-media", "convert-media", "apply-manifest", "status", "failure-report"])
+    parser.add_argument("command", choices=["probe", "scrape", "resume", "download-media", "convert-media", "apply-manifest", "reproject", "status", "failure-report"])
     parser.add_argument("--manifest", default=None, help="Manifest JSONL (from scripts/export_manifest.py) with per-image output policy.")
     parser.add_argument("--report-path", default=None, help="Output CSV for failure-report (default: <output-dir>/failed_media.csv).")
     parser.add_argument("--api-key", default=None)
