@@ -21,13 +21,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import random
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -43,11 +46,27 @@ from _common import (
 )
 
 try:
-    import cv2
+    cv2: Any = importlib.import_module("cv2")
 except Exception:
     cv2 = None
 
 USER_AGENT = "smithsonian-subsampling"
+
+
+def fmt_bytes(size: int | None) -> str:
+    if size is None:
+        return "unknown"
+    units = ("B", "KB", "MB", "GB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def fmt_mp(pixels: int | None) -> str:
+    return "unknown MP" if not pixels else f"{pixels / 1_000_000:.1f} MP"
 
 
 def sample_resources(conn, per_stratum: int, max_images: int) -> list[dict]:
@@ -80,16 +99,21 @@ def sample_resources(conn, per_stratum: int, max_images: int) -> list[dict]:
             continue
         quotas[key] = quotas.get(key, 0) + 1
         samples.append({**dict(row), "bucket": bucket})
+        if len(samples) % 25 == 0 or len(samples) == max_images:
+            print(f"  sampled {len(samples)}/{max_images} resources after {attempts:,} row probes")
     return samples
 
 
 def download(client: httpx.Client, url: str, target: Path) -> Path | None:
     try:
+        started = time.monotonic()
         with client.stream("GET", url) as response:
             response.raise_for_status()
             with target.open("wb") as handle:
                 for chunk in response.iter_bytes():
                     handle.write(chunk)
+        elapsed = time.monotonic() - started
+        print(f"    downloaded {fmt_bytes(target.stat().st_size)} in {elapsed:.1f}s")
         return target
     except httpx.HTTPError as error:
         print(f"  ! download failed: {url} ({error})")
@@ -98,14 +122,18 @@ def download(client: httpx.Client, url: str, target: Path) -> Path | None:
 
 def encode_jxl(cjxl: str, source: Path, target: Path, quality: int) -> int | None:
     command = [cjxl, str(source), str(target), "-q", str(quality), "--lossless_jpeg=0", "--num_threads", "4"]
+    started = time.monotonic()
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0 or not target.exists():
         print(f"  ! cjxl failed for {source.name}: {result.stderr.strip()[:200]}")
         return None
+    elapsed = time.monotonic() - started
+    print(f"    encoded {target.name} -> {fmt_bytes(target.stat().st_size)} in {elapsed:.1f}s")
     return target.stat().st_size
 
 
 def downscale(image, max_pixels: int):
+    assert cv2 is not None
     height, width = image.shape[:2]
     pixels = width * height
     if pixels <= max_pixels:
@@ -161,11 +189,15 @@ def main() -> None:
 
     if shutil.which(args.cjxl) is None:
         raise SystemExit(f"cjxl not found ({args.cjxl!r}); install libjxl or pass --cjxl")
+    if cv2 is None:
+        print("warning: OpenCV unavailable; downscaled cap measurements will be skipped")
 
+    print(f"opening database: {args.db}")
     conn = open_db(args.db)
     reports = ensure_dir(args.reports_dir)
     work_dir = ensure_dir(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="smithsonian_bpp_"))
 
+    print(f"sampling up to {args.max_images} images ({args.per_stratum} per unit/bucket stratum)")
     samples = sample_resources(conn, args.per_stratum, args.max_images)
     print(f"sampled {len(samples)} resources across units/buckets; downloading to {work_dir}")
 
@@ -177,6 +209,11 @@ def main() -> None:
 
     with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=120.0, follow_redirects=True) as client:
         for index, sample in enumerate(samples, 1):
+            pixels = sample["width"] * sample["height"] if sample["width"] and sample["height"] else None
+            print(
+                f"[{index}/{len(samples)}] {sample['unit_code']} {sample['bucket']} "
+                f"{fmt_mp(pixels)} {sample['resource_key'][:12]}"
+            )
             source = download(client, sample["url"], work_dir / f"src_{sample['resource_key'][:12]}.bin")
             if source is None:
                 continue
@@ -195,9 +232,11 @@ def main() -> None:
                 per_unit[sample["unit_code"]].append(bpp)
 
             if image is not None:
+                assert cv2 is not None
                 for cap, sink in ((MAIN_MAX_PIXELS, main_bpp), (SECONDARY_MAX_PIXELS, secondary_bpp)):
                     if pixels <= cap:
                         continue
+                    print(f"    downscaling to cap {fmt_mp(cap)}")
                     scaled = downscale(image, cap)
                     png = source.with_name(f"{source.stem}_{cap}.png")
                     cv2.imwrite(str(png), scaled)
@@ -210,9 +249,12 @@ def main() -> None:
             if not args.keep_files:
                 source.unlink(missing_ok=True)
                 source.with_suffix(".jxl").unlink(missing_ok=True)
+                print("    cleaned temporary files")
             if index % 10 == 0 or index == len(samples):
                 print(f"  {index}/{len(samples)} processed")
 
+        if args.probe_ids:
+            print("probing IDS max= resizing")
         ids_results = probe_ids(client, samples, work_dir) if args.probe_ids else []
 
     calibration = {
