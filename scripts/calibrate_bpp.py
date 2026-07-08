@@ -97,7 +97,7 @@ def download(client: httpx.Client, url: str, target: Path) -> Path | None:
 
 
 def encode_jxl(cjxl: str, source: Path, target: Path, quality: int) -> int | None:
-    command = [cjxl, str(source), str(target), "-q", str(quality), "--num_threads", "4"]
+    command = [cjxl, str(source), str(target), "-q", str(quality), "--lossless_jpeg=0", "--num_threads", "4"]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0 or not target.exists():
         print(f"  ! cjxl failed for {source.name}: {result.stderr.strip()[:200]}")
