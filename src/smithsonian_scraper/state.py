@@ -37,6 +37,7 @@ class StateStore:
     async def initialize(self) -> None:
         async with self._lock:
             self._connection.executescript(SCHEMA)
+            self._ensure_conversion_policy_columns()
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
@@ -44,6 +45,20 @@ class StateStore:
             self._connection.execute("UPDATE media_resources SET status = 'pending' WHERE status = 'running'")
             self._connection.execute("UPDATE media_conversions SET status = 'pending' WHERE status = 'running'")
             self._connection.commit()
+
+    def _ensure_conversion_policy_columns(self) -> None:
+        """Migrate pre-policy databases: add per-output policy columns."""
+        existing = {row["name"] for row in self._connection.execute("PRAGMA table_info(media_conversions)")}
+        for column, ddl in (
+            ("output_kind", "output_kind TEXT NOT NULL DEFAULT 'highres'"),
+            ("target_max_pixels", "target_max_pixels INTEGER"),
+            ("target_edge", "target_edge INTEGER"),
+            ("quality", "quality INTEGER"),
+            ("resize_algorithm", "resize_algorithm TEXT NOT NULL DEFAULT ''"),
+            ("output_format", "output_format TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in existing:
+                self._connection.execute(f"ALTER TABLE media_conversions ADD COLUMN {ddl}")
 
     async def upsert_record_projection(
         self,
@@ -477,6 +492,12 @@ class StateStore:
                     AND media_resources.preferred_download = 1
                     AND (media_resources.status = 'pending'
                         OR (media_resources.status = 'failed' AND media_resources.attempts < ?))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM media_policy
+                        WHERE media_policy.url = media_resources.url
+                            AND media_policy.output_kind = 'highres'
+                            AND media_policy.tier = 'drop'
+                    )
                 ORDER BY media_resources.updated_at ASC
                 LIMIT ?
                 """,
@@ -514,6 +535,65 @@ class StateStore:
             )
             self._connection.commit()
 
+    async def apply_manifest(self, manifest_path: Path) -> int:
+        """Load a manifest.jsonl (from scripts/export_manifest.py) into the
+        media_policy table. Rows are keyed by (url, output_kind); the URL is
+        the join key between the analysis manifest and media_resources."""
+        async with self._lock:
+            count = 0
+            batch: list[tuple] = []
+
+            def flush() -> None:
+                if batch:
+                    self._connection.executemany(
+                        """
+                        INSERT OR REPLACE INTO media_policy (
+                            url, output_kind, tier, drop_reason, target_max_pixels,
+                            target_edge, resize_algorithm, output_format, quality, output_path
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                    batch.clear()
+
+            with manifest_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    url = str(row.get("url") or "")
+                    if not url:
+                        continue
+                    batch.append(
+                        (
+                            url,
+                            str(row.get("output_kind") or "highres"),
+                            str(row.get("tier") or ""),
+                            str(row.get("drop_reason") or ""),
+                            row.get("target_max_pixels"),
+                            row.get("target_edge"),
+                            str(row.get("resize_algorithm") or ""),
+                            str(row.get("output_format") or ""),
+                            row.get("quality"),
+                            str(row.get("output_path") or ""),
+                        )
+                    )
+                    count += 1
+                    if len(batch) >= 5000:
+                        flush()
+            flush()
+            self._connection.commit()
+            return count
+
+    async def has_media_policy(self, url: str) -> bool:
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM media_policy WHERE url = ? LIMIT 1",
+                (url,),
+            ).fetchone()
+            return row is not None
+
     async def enqueue_media_conversion(
         self,
         resource_key: str,
@@ -522,6 +602,23 @@ class StateStore:
         target_format: str = "jxl",
     ) -> None:
         async with self._lock:
+            url_row = self._connection.execute(
+                "SELECT url FROM media_resources WHERE resource_key = ?",
+                (resource_key,),
+            ).fetchone()
+            url = str(url_row["url"]) if url_row else ""
+            policies = (
+                self._connection.execute(
+                    "SELECT * FROM media_policy WHERE url = ?",
+                    (url,),
+                ).fetchall()
+                if url
+                else []
+            )
+            highres = next((p for p in policies if str(p["output_kind"]) == "highres"), None)
+            if highres is not None and str(highres["tier"]) == "drop":
+                self._connection.commit()
+                return
             self._connection.execute(
                 """
                 INSERT INTO media_conversions (
@@ -548,6 +645,65 @@ class StateStore:
                 """,
                 (resource_key, target_format, str(source_path)),
             )
+            if highres is not None:
+                self._connection.execute(
+                    """
+                    UPDATE media_conversions
+                    SET output_kind = 'highres', target_max_pixels = ?, quality = ?,
+                        resize_algorithm = ?, output_format = ?, output_path = ?
+                    WHERE resource_key = ? AND target_format = ? AND status != 'complete'
+                    """,
+                    (
+                        highres["target_max_pixels"],
+                        highres["quality"],
+                        str(highres["resize_algorithm"] or ""),
+                        str(highres["output_format"] or ""),
+                        str(highres["output_path"] or ""),
+                        resource_key,
+                        target_format,
+                    ),
+                )
+            for policy in policies:
+                kind = str(policy["output_kind"])
+                if kind == "highres" or not policy["target_edge"]:
+                    continue
+                # Derivative jobs reuse the (resource_key, target_format) primary
+                # key with a synthetic format like 'jpg256'; the real output
+                # location comes from output_path.
+                derivative_format = f"{policy['output_format'] or 'jpg'}{policy['target_edge']}"
+                self._connection.execute(
+                    """
+                    INSERT INTO media_conversions (
+                        resource_key, target_format, source_path, output_path, status,
+                        attempts, error, size_bytes, created_at, updated_at,
+                        output_kind, target_edge, quality, resize_algorithm, output_format
+                    ) VALUES (?, ?, ?, ?, 'pending', 0, '', 0, unixepoch(), unixepoch(), ?, ?, ?, ?, ?)
+                    ON CONFLICT(resource_key, target_format) DO UPDATE SET
+                        source_path = CASE
+                            WHEN media_conversions.status = 'complete' THEN media_conversions.source_path
+                            ELSE excluded.source_path
+                        END,
+                        status = CASE
+                            WHEN media_conversions.status = 'complete' THEN media_conversions.status
+                            ELSE 'pending'
+                        END,
+                        updated_at = CASE
+                            WHEN media_conversions.status = 'complete' THEN media_conversions.updated_at
+                            ELSE unixepoch()
+                        END
+                    """,
+                    (
+                        resource_key,
+                        derivative_format,
+                        str(source_path),
+                        str(policy["output_path"] or ""),
+                        kind,
+                        policy["target_edge"],
+                        policy["quality"],
+                        str(policy["resize_algorithm"] or ""),
+                        str(policy["output_format"] or ""),
+                    ),
+                )
             self._connection.commit()
 
     async def enqueue_pending_tiff_conversions(self, *, target_format: str = "jxl") -> int:
@@ -629,6 +785,16 @@ class StateStore:
                     OR (status = 'failed' AND attempts < ?)
                 """,
                 (max_attempts,),
+            ).fetchone()
+            return int(row["count"])
+
+    async def incomplete_conversions_for_source(self, source_path: str) -> int:
+        """Outputs still owed from this source file - the source must not be
+        deleted until this reaches zero (derivatives read the original)."""
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM media_conversions WHERE source_path = ? AND status != 'complete'",
+                (source_path,),
             ).fetchone()
             return int(row["count"])
 
@@ -932,12 +1098,33 @@ CREATE TABLE IF NOT EXISTS media_conversions (
     size_bytes INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    output_kind TEXT NOT NULL DEFAULT 'highres',
+    target_max_pixels INTEGER,
+    target_edge INTEGER,
+    quality INTEGER,
+    resize_algorithm TEXT NOT NULL DEFAULT '',
+    output_format TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (resource_key, target_format),
     FOREIGN KEY (resource_key) REFERENCES media_resources(resource_key) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_media_conversions_status ON media_conversions(status);
 CREATE INDEX IF NOT EXISTS idx_media_conversions_resource_key ON media_conversions(resource_key);
+CREATE INDEX IF NOT EXISTS idx_media_conversions_source_path ON media_conversions(source_path);
+
+CREATE TABLE IF NOT EXISTS media_policy (
+    url TEXT NOT NULL,
+    output_kind TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT '',
+    drop_reason TEXT NOT NULL DEFAULT '',
+    target_max_pixels INTEGER,
+    target_edge INTEGER,
+    resize_algorithm TEXT NOT NULL DEFAULT '',
+    output_format TEXT NOT NULL DEFAULT '',
+    quality INTEGER,
+    output_path TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (url, output_kind)
+);
 
 CREATE TABLE IF NOT EXISTS failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

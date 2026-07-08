@@ -30,6 +30,7 @@ class ScraperConfig:
     skip_conversion_metadata: bool = False
     cjxl_path: Path | None = None
     exiftool_path: Path | None = None
+    magick_path: Path | None = None
     query: str = "*:*"
     sort: str = "id"
     record_type: str = "edanmdm"
@@ -84,6 +85,7 @@ def build_config(
     skip_conversion_metadata: bool = False,
     cjxl_path: str | Path | None = None,
     exiftool_path: str | Path | None = None,
+    magick_path: str | Path | None = None,
     query: str = "*:*",
     sort: str = "id",
     record_type: str = "edanmdm",
@@ -96,6 +98,7 @@ def build_config(
     db_path = Path(database_path) if database_path else output_path / "smithsonian_scraper.sqlite3"
     configured_cjxl = cjxl_path or os.getenv("CJXL_PATH") or None
     configured_exiftool = exiftool_path or os.getenv("EXIFTOOL_PATH") or None
+    configured_magick = magick_path or os.getenv("MAGICK_PATH") or None
     return ScraperConfig(
         api_key=api_key or os.getenv("SMITHSONIAN_API_KEY", ""),
         output_dir=output_path,
@@ -124,6 +127,7 @@ def build_config(
         skip_conversion_metadata=skip_conversion_metadata,
         cjxl_path=Path(configured_cjxl) if configured_cjxl else None,
         exiftool_path=Path(configured_exiftool) if configured_exiftool else None,
+        magick_path=Path(configured_magick) if configured_magick else None,
         query=query,
         sort=sort,
         record_type=record_type,

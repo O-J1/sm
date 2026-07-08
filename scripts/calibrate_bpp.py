@@ -2,10 +2,15 @@
 
 Since no images are downloaded yet, the storage budget must be estimated
 from metadata (width x height). This script downloads a stratified sample
-(per unit x megapixel bucket), encodes it with cjxl at the target quality,
-and measures bytes-per-pixel at native resolution and at the two policy
-caps (8,388,608 px main / 4,194,304 px secondary, downscaled with OpenCV
-Lanczos like the existing conversion pipeline).
+(per unit x megapixel bucket), encodes it with cjxl at the target quality
+(default q=95), and measures bytes-per-pixel at native resolution and at
+the two policy caps (8,388,608 px main / 2,097,152 px secondary, downscaled
+with OpenCV Lanczos like the existing conversion pipeline).
+
+It also measures bytes-per-pixel of the small pretraining derivatives
+(256px/512px longest edge, JPEG by default). The production pipeline
+downscales those with ImageMagick Lanczos2Sharp; OpenCV Lanczos4 is used
+here as a close stand-in since the file-size difference is negligible.
 
 Optionally probes whether the IDS delivery service honours a `max=` size
 parameter - if it does, tier B/C images can be downloaded pre-downscaled,
@@ -14,7 +19,7 @@ saving enormous bandwidth.
 Output: reports/calibration.json (consumed by estimate_budget.py).
 
 Usage:
-    python scripts/calibrate_bpp.py [--db PATH] [--max-images 200] [--quality 97]
+    python scripts/calibrate_bpp.py [--db PATH] [--max-images 200] [--quality 95]
                                     [--cjxl cjxl] [--probe-ids] [--keep-files]
 """
 
@@ -35,7 +40,9 @@ from typing import Any
 import httpx
 
 from _common import (
+    DEFAULT_DERIVATIVE_QUALITY,
     DEFAULT_JXL_QUALITY,
+    DERIVATIVE_EDGES,
     MAIN_MAX_PIXELS,
     SECONDARY_MAX_PIXELS,
     add_common_arguments,
@@ -142,6 +149,16 @@ def downscale(image, max_pixels: int):
     return cv2.resize(image, (max(1, round(width * scale)), max(1, round(height * scale))), interpolation=cv2.INTER_LANCZOS4)
 
 
+def downscale_edge(image, edge: int):
+    """Aspect-preserving resize so the longest edge equals `edge` (no upscaling)."""
+    assert cv2 is not None
+    height, width = image.shape[:2]
+    scale = edge / max(width, height)
+    if scale >= 1.0:
+        return image
+    return cv2.resize(image, (max(1, round(width * scale)), max(1, round(height * scale))), interpolation=cv2.INTER_LANCZOS4)
+
+
 def probe_ids(client: httpx.Client, samples: list[dict], work_dir: Path, limit: int = 5) -> list[dict]:
     results = []
     candidates = [s for s in samples if "ids.si.edu" in s["url"]][:limit]
@@ -181,6 +198,10 @@ def main() -> None:
     parser.add_argument("--max-images", type=int, default=200)
     parser.add_argument("--per-stratum", type=int, default=3)
     parser.add_argument("--quality", type=int, default=DEFAULT_JXL_QUALITY)
+    parser.add_argument("--derivative-edges", default=",".join(str(edge) for edge in DERIVATIVE_EDGES),
+                        help="Comma-separated longest-edge sizes for derivative bpp measurement ('' = skip).")
+    parser.add_argument("--derivative-quality", type=int, default=DEFAULT_DERIVATIVE_QUALITY,
+                        help="JPEG quality used for derivative measurement.")
     parser.add_argument("--cjxl", default="cjxl", help="Path to the cjxl binary.")
     parser.add_argument("--work-dir", type=Path, default=None, help="Scratch dir (default: temp).")
     parser.add_argument("--keep-files", action="store_true")
@@ -204,6 +225,8 @@ def main() -> None:
     native_bpp: list[float] = []
     main_bpp: list[float] = []
     secondary_bpp: list[float] = []
+    derivative_edges = [int(part) for part in str(args.derivative_edges).split(",") if part.strip()]
+    derivative_bpp: dict[int, list[float]] = {edge: [] for edge in derivative_edges}
     per_unit: dict[str, list[float]] = defaultdict(list)
     per_unit_px: dict[str, list[int]] = defaultdict(list)
 
@@ -246,6 +269,15 @@ def main() -> None:
                     if not args.keep_files:
                         png.unlink(missing_ok=True)
                         png.with_suffix(".jxl").unlink(missing_ok=True)
+                for edge in derivative_edges:
+                    if max(image.shape[:2]) <= edge:
+                        continue
+                    scaled = downscale_edge(image, edge)
+                    jpg = source.with_name(f"{source.stem}_deriv{edge}.jpg")
+                    if cv2.imwrite(str(jpg), scaled, [int(cv2.IMWRITE_JPEG_QUALITY), args.derivative_quality]):
+                        derivative_bpp[edge].append(jpg.stat().st_size / (scaled.shape[0] * scaled.shape[1]))
+                    if not args.keep_files:
+                        jpg.unlink(missing_ok=True)
             if not args.keep_files:
                 source.unlink(missing_ok=True)
                 source.with_suffix(".jxl").unlink(missing_ok=True)
@@ -262,6 +294,8 @@ def main() -> None:
         "native_bpp": stats(native_bpp),
         "main_cap_bpp": stats(main_bpp),
         "secondary_cap_bpp": stats(secondary_bpp),
+        "derivative_quality": args.derivative_quality,
+        "derivative_bpp": {str(edge): stats(values) for edge, values in derivative_bpp.items()},
         "per_unit_native_median": {unit: round(median(values), 4) for unit, values in sorted(per_unit.items())},
         "per_unit_measured_mp_median": {
             unit: round(median(values) / 1e6, 3) for unit, values in sorted(per_unit_px.items())

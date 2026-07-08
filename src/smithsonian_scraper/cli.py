@@ -27,9 +27,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in {"scrape", "resume"}:
             asyncio.run(_scrape(config, download_media_after=args.download_media))
         elif args.command == "download-media":
-            asyncio.run(_download_media(config))
+            asyncio.run(_download_media(config, manifest_path=_manifest_path(args)))
         elif args.command == "convert-media":
-            asyncio.run(_convert_media(config))
+            asyncio.run(_convert_media(config, manifest_path=_manifest_path(args)))
+        elif args.command == "apply-manifest":
+            asyncio.run(_apply_manifest(config, _manifest_path(args, required=True)))
         elif args.command == "status":
             asyncio.run(_status(config))
         elif args.command == "failure-report":
@@ -89,10 +91,17 @@ async def _scrape(config: ScraperConfig, *, download_media_after: bool) -> None:
     await state.close()
 
 
-async def _download_media(config: ScraperConfig, existing_state: StateStore | None = None) -> None:
+async def _download_media(
+    config: ScraperConfig,
+    existing_state: StateStore | None = None,
+    manifest_path: Path | None = None,
+) -> None:
     state = existing_state or StateStore(config.database_path)
     if existing_state is None:
         await state.initialize()
+    if manifest_path is not None:
+        count = await state.apply_manifest(manifest_path)
+        _print_progress(f"manifest applied: {count:,} output jobs from {manifest_path}")
     conversion_wake = asyncio.Event()
     downloads_done = asyncio.Event()
     conversion_task = None
@@ -175,7 +184,11 @@ async def _download_media(config: ScraperConfig, existing_state: StateStore | No
             await state.close()
 
 
-async def _convert_media(config: ScraperConfig, existing_state: StateStore | None = None) -> None:
+async def _convert_media(
+    config: ScraperConfig,
+    existing_state: StateStore | None = None,
+    manifest_path: Path | None = None,
+) -> None:
     if not _conversion_enabled(config):
         raise ValueError("CJXL_PATH and EXIFTOOL_PATH, or --cjxl-path and --exiftool-path, are required for convert-media")
 
@@ -183,10 +196,23 @@ async def _convert_media(config: ScraperConfig, existing_state: StateStore | Non
     if existing_state is None:
         await state.initialize()
     try:
+        if manifest_path is not None:
+            count = await state.apply_manifest(manifest_path)
+            _print_progress(f"manifest applied: {count:,} output jobs from {manifest_path}")
         await _run_conversion_worker(config, state)
     finally:
         if existing_state is None:
             await state.close()
+
+
+async def _apply_manifest(config: ScraperConfig, manifest_path: Path) -> None:
+    state = StateStore(config.database_path)
+    await state.initialize()
+    try:
+        count = await state.apply_manifest(manifest_path)
+        print(f"manifest applied: {count:,} output jobs from {manifest_path}")
+    finally:
+        await state.close()
 
 
 async def _run_conversion_worker(
@@ -209,6 +235,7 @@ async def _run_conversion_worker(
         skip_metadata=config.skip_conversion_metadata,
         timeout=config.conversion_timeout,
         progress=_print_progress,
+        magick_path=config.magick_path,
     )
     timeout_text = f"timeout={config.conversion_timeout}s" if config.conversion_timeout is not None else "timeout=none"
     _print_progress(
@@ -262,7 +289,12 @@ async def _run_conversion_worker(
                     size,
                     target_format=row["target_format"],
                 )
-                _delete_source_tiff(Path(row["source_path"]))
+                # A source may owe several outputs (highres + 256/512
+                # derivatives from the original file): only delete it once
+                # every sibling output has completed.
+                source_path = str(row["source_path"])
+                if await state.incomplete_conversions_for_source(source_path) == 0:
+                    _delete_source_tiff(Path(source_path))
 
 
 async def _status(config: ScraperConfig) -> None:
@@ -307,6 +339,7 @@ def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
         skip_conversion_metadata=args.skip_conversion_metadata,
         cjxl_path=args.cjxl_path,
         exiftool_path=args.exiftool_path,
+        magick_path=args.magick_path,
         query=args.query,
         sort=args.sort,
         record_type=args.record_type,
@@ -319,7 +352,8 @@ def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="smithsonian-scraper")
-    parser.add_argument("command", choices=["probe", "scrape", "resume", "download-media", "convert-media", "status", "failure-report"])
+    parser.add_argument("command", choices=["probe", "scrape", "resume", "download-media", "convert-media", "apply-manifest", "status", "failure-report"])
+    parser.add_argument("--manifest", default=None, help="Manifest JSONL (from scripts/export_manifest.py) with per-image output policy.")
     parser.add_argument("--report-path", default=None, help="Output CSV for failure-report (default: <output-dir>/failed_media.csv).")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--output-dir", default="data")
@@ -340,6 +374,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-conversion-metadata", action="store_true")
     parser.add_argument("--cjxl-path", default=None)
     parser.add_argument("--exiftool-path", default=None)
+    parser.add_argument("--magick-path", default=None, help="ImageMagick binary for Lanczos2Sharp derivative outputs (or MAGICK_PATH).")
     parser.add_argument("--query", default="*:*")
     parser.add_argument("--sort", default="id", choices=["id", "newest", "updated", "random"])
     parser.add_argument("--record-type", default="edanmdm")
@@ -352,6 +387,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _manifest_path(args: argparse.Namespace, *, required: bool = False) -> Path | None:
+    if args.manifest:
+        return Path(args.manifest)
+    if required:
+        raise ValueError("--manifest is required for apply-manifest")
+    return None
 
 
 def _is_tiff_conversion_candidate(row, path) -> bool:

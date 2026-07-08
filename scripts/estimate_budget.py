@@ -1,23 +1,27 @@
 """Project storage cost of the tiered subsampling policy and sweep the
 artist cutoff so the collection fits the disk budget.
 
-Policy per record (user decision):
-  - Tier A: records by a top-N ranked artist keep every image at native
-    resolution (JXL q=97).
-  - Tier B: the record's main image (first media item) capped at 8,388,608 px.
-  - Tier C: additional views capped at 4,194,304 px.
-  - Tier D (optional, --median-cap): views beyond the per-unit median
-    images-per-record are dropped entirely (for non-tier-A records).
+Policy per record (user decision, see _common.SubsamplePolicy):
+  - full:      records by a top-N ranked artist keep every image at native
+               resolution (JXL q=95).
+  - main:      the record's main image (first media item) capped at
+               8,388,608 px (NMNHBOTANY: 4,194,304 px).
+  - secondary: additional views capped at 2,097,152 px.
+  - drop:      images below 1MP, and NMNHBOTANY views beyond the first 10
+               per specimen record.
+  - derivatives: kept non-full images reduced by >= 4x also get 256px and
+               512px longest-edge Lanczos2Sharp resizes from the original
+               file (pretraining set; counted in the budget).
 
 Sizes are estimated as pixels x bytes-per-pixel, using measured values from
-reports/calibration.json when present (run calibrate_bpp.py), otherwise
-conservative fallbacks. A single streaming pass accumulates bytes per artist
-rank, so the whole cutoff curve comes from one database scan.
+reports/calibration.json when present (run calibrate_bpp.py --quality 95),
+otherwise conservative fallbacks. A single streaming pass accumulates bytes
+per artist rank, so the whole cutoff curve comes from one database scan.
 
 Usage:
     python scripts/estimate_budget.py [--db PATH] [--budget-tb 8]
                                       [--top-ns 0,250,500,1000,2500,5000,10000,all]
-                                      [--median-cap] [--cc0-only]
+                                      [--cc0-only] [policy knobs, see --help]
 """
 
 from __future__ import annotations
@@ -25,19 +29,22 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from _common import (
-    MAIN_MAX_PIXELS,
-    SECONDARY_MAX_PIXELS,
     GroupedCursor,
     add_common_arguments,
-    histogram_median,
+    add_policy_arguments,
+    derivative_pixels,
     load_bpp,
+    load_derivative_bpp,
     load_rank_map,
     median,
     name_key,
     open_db,
+    policy_from_args,
+    warn_calibration_quality,
     write_csv,
 )
 
@@ -57,8 +64,9 @@ def load_measured_px(calibration_path: Path) -> dict[str, int]:
     }
 
 
-def unit_medians(conn, media_type: str) -> tuple[dict[str, int], dict[str, int]]:
-    """Per-unit median pixels (dims fallback) and median images-per-record."""
+def unit_median_pixels(conn, media_type: str) -> dict[str, int]:
+    """Per-unit median pixels from metadata dimensions, the fallback for
+    images whose metadata lacks width/height."""
     pixels: dict[str, list[int]] = defaultdict(list)
     for unit, px in conn.execute(
         """
@@ -69,22 +77,7 @@ def unit_medians(conn, media_type: str) -> tuple[dict[str, int], dict[str, int]]
         (media_type,),
     ):
         pixels[unit].append(px)
-    median_px = {unit: int(median(values)) for unit, values in pixels.items()}
-
-    hist: dict[str, dict[int, int]] = defaultdict(dict)
-    for unit, cnt, records in conn.execute(
-        """
-        SELECT unit_code, cnt, COUNT(*)
-        FROM (SELECT unit_code, record_id, COUNT(*) AS cnt
-              FROM media_assets WHERE media_type = ?
-              GROUP BY unit_code, record_id)
-        GROUP BY unit_code, cnt
-        """,
-        (media_type,),
-    ):
-        hist[unit][cnt] = records
-    median_images = {unit: max(1, int(histogram_median(h))) for unit, h in hist.items()}
-    return median_px, median_images
+    return {unit: int(median(values)) for unit, values in pixels.items()}
 
 
 def iter_record_images(conn, media_type: str, cc0_only: bool):
@@ -120,87 +113,168 @@ def record_rank(facets: GroupedCursor, record_id: str, rank_map: dict[str, int])
     return best
 
 
+@dataclass
+class RankBucket:
+    """Per-artist-rank accumulator holding both possible outcomes for its
+    images: the tier-A ('full') outcome and the non-tier-A policy outcome."""
+
+    images: int = 0
+    full_bytes: float = 0.0
+    full_kept: int = 0
+    policy_bytes: float = 0.0
+    policy_native: int = 0
+    policy_main_down: int = 0
+    policy_secondary_down: int = 0
+    drop_low: int = 0
+    drop_cap: int = 0
+    derivative_bytes: float = 0.0
+    derivative_counts: dict[int, int] = field(default_factory=dict)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_arguments(parser)
+    add_policy_arguments(parser)
     parser.add_argument("--rankings-csv", type=Path, default=None)
     parser.add_argument("--budget-tb", type=float, default=8.0)
     parser.add_argument("--top-ns", default="0,250,500,1000,2500,5000,10000,25000,all")
-    parser.add_argument("--median-cap", action="store_true", help="Also drop views beyond the per-unit median (tier D).")
     parser.add_argument("--cc0-only", action="store_true")
     parser.add_argument("--media-type", default="Images")
     args = parser.parse_args()
 
+    policy = policy_from_args(args)
     conn = open_db(args.db)
     reports = args.reports_dir
     rankings_csv = args.rankings_csv or (reports / "artist_rankings.csv")
     rank_map = load_rank_map(rankings_csv)
-    native_bpp, downscaled_bpp = load_bpp(reports / "calibration.json")
-    print(f"bpp model: native={native_bpp} downscaled={downscaled_bpp} "
-          f"({'calibrated' if (reports / 'calibration.json').exists() else 'FALLBACK - run calibrate_bpp.py'})")
+    calibration_path = reports / "calibration.json"
+    native_bpp, downscaled_bpp = load_bpp(calibration_path)
+    derivative_bpp = load_derivative_bpp(calibration_path, policy.derivative_edges)
+    warn_calibration_quality(calibration_path, policy.quality)
+    print(f"bpp model: native={native_bpp} downscaled={downscaled_bpp} derivative={derivative_bpp} "
+          f"({'calibrated' if calibration_path.exists() else 'FALLBACK - run calibrate_bpp.py'})")
 
-    median_px, median_images = unit_medians(conn, args.media_type)
-    for unit, px in load_measured_px(reports / "calibration.json").items():
+    median_px = unit_median_pixels(conn, args.media_type)
+    for unit, px in load_measured_px(calibration_path).items():
         median_px.setdefault(unit, px)
     facets = GroupedCursor(
         conn.execute("SELECT record_id, content FROM record_freetext WHERE category = 'name' ORDER BY record_id")
     )
 
-    # Per-rank accumulators: [images, native_bytes, capped_bytes, capped_bytes_median_cap, dropped_images]
-    per_rank: dict[int, list[float]] = defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0])
+    buckets: dict[int, RankBucket] = defaultdict(RankBucket)
     total_images = 0
 
     for record_id, unit_code, images in iter_record_images(conn, args.media_type, args.cc0_only):
         rank = record_rank(facets, record_id, rank_map)
-        bucket = per_rank[rank]
-        image_cap = median_images.get(unit_code, 1)
+        bucket = buckets[rank]
         for index, (_, _, _, width, height, _, _) in enumerate(images):
             px = width * height if width and height else median_px.get(unit_code, 4_000_000)
-            cap = MAIN_MAX_PIXELS if index == 0 else SECONDARY_MAX_PIXELS
-            native_bytes = px * native_bpp
-            capped_bytes = native_bytes if px <= cap else cap * downscaled_bpp
-            bucket[0] += 1
-            bucket[1] += native_bytes
-            bucket[2] += capped_bytes
-            if index < image_cap:
-                bucket[3] += capped_bytes
-            else:
-                bucket[4] += 1
+            bucket.images += 1
             total_images += 1
 
-    ranks = sorted(per_rank)
+            # Outcome if this record's artist makes the top-N cut.
+            full = policy.classify(unit_code=unit_code, index=index, pixels=px, is_top_artist=True)
+            if full.tier != "drop":
+                bucket.full_bytes += px * native_bpp
+                bucket.full_kept += 1
+
+            # Outcome if it does not.
+            decision = policy.classify(unit_code=unit_code, index=index, pixels=px, is_top_artist=False)
+            if decision.tier == "drop":
+                if decision.drop_reason == "low_quality":
+                    bucket.drop_low += 1
+                else:
+                    bucket.drop_cap += 1
+                continue
+            cap = decision.target_max_pixels or px
+            if px <= cap:
+                bucket.policy_bytes += px * native_bpp
+                bucket.policy_native += 1
+            else:
+                bucket.policy_bytes += cap * downscaled_bpp
+                if decision.tier == "main":
+                    bucket.policy_main_down += 1
+                else:
+                    bucket.policy_secondary_down += 1
+            for edge in decision.derivative_edges:
+                bucket.derivative_bytes += derivative_pixels(width, height, edge) * derivative_bpp[edge]
+                bucket.derivative_counts[edge] = bucket.derivative_counts.get(edge, 0) + 1
+
+    ranks = sorted(buckets)
     ranked_artists = len(rank_map)
     sweep = []
     for token in args.top_ns.split(","):
         token = token.strip().lower()
         sweep.append(ranked_artists if token == "all" else int(token))
 
-    capped_index = 3 if args.median_cap else 2
+    edge_labels = [f"deriv_{edge}" for edge in policy.derivative_edges]
     rows = []
-    print(f"\ntotal images: {total_images:,}  ranked artists: {ranked_artists:,}  "
-          f"scenario: {'median-cap (tier D)' if args.median_cap else 'no tier D'}")
-    print(f"{'top_n':>8} {'total_TB':>10} {'full_res':>12} {'downscaled':>12} {'dropped':>10} {'fits_' + str(args.budget_tb) + 'TB':>10}")
+    print(f"\ntotal images: {total_images:,}  ranked artists: {ranked_artists:,}  quality: q{policy.quality}")
+    header = (f"{'top_n':>8} {'total_TB':>9} {'hires_TB':>9} {'deriv_TB':>9} {'full_res':>10} "
+              f"{'native':>10} {'downscaled':>11} {'drop_low':>9} {'drop_cap':>9} "
+              f"{'fits_' + str(args.budget_tb) + 'TB':>9}")
+    print(header)
     for top_n in sweep:
-        total_bytes = 0.0
-        full_res = 0
-        dropped = 0
+        highres_bytes = 0.0
+        derivative_bytes = 0.0
+        full_res = native_kept = main_down = secondary_down = 0
+        drop_low = drop_cap = 0
+        derivative_counts = {edge: 0 for edge in policy.derivative_edges}
         for rank in ranks:
-            images, native_bytes, capped_bytes, capped_median, dropped_count = per_rank[rank]
+            bucket = buckets[rank]
+            drop_low += bucket.drop_low
             if rank < top_n:
-                total_bytes += native_bytes
-                full_res += images
+                highres_bytes += bucket.full_bytes
+                full_res += bucket.full_kept
             else:
-                total_bytes += (capped_median if args.median_cap else capped_bytes)
-                dropped += dropped_count if args.median_cap else 0
-        total_tb = total_bytes / 1e12
-        downscaled = total_images - full_res - dropped
+                highres_bytes += bucket.policy_bytes
+                derivative_bytes += bucket.derivative_bytes
+                native_kept += bucket.policy_native
+                main_down += bucket.policy_main_down
+                secondary_down += bucket.policy_secondary_down
+                drop_cap += bucket.drop_cap
+                for edge, count in bucket.derivative_counts.items():
+                    derivative_counts[edge] = derivative_counts.get(edge, 0) + count
+        total_tb = (highres_bytes + derivative_bytes) / 1e12
+        downscaled = main_down + secondary_down
         fits = "yes" if total_tb <= args.budget_tb else "no"
-        print(f"{top_n:>8,} {total_tb:>10.2f} {full_res:>12,} {downscaled:>12,} {dropped:>10,} {fits:>10}")
-        rows.append([top_n, args.median_cap, round(total_tb, 3), full_res, downscaled, dropped, fits])
+        print(f"{top_n:>8,} {total_tb:>9.2f} {highres_bytes / 1e12:>9.2f} {derivative_bytes / 1e12:>9.3f} "
+              f"{full_res:>10,} {native_kept:>10,} {downscaled:>11,} {drop_low:>9,} {drop_cap:>9,} {fits:>9}")
+        rows.append(
+            [
+                top_n,
+                policy.quality,
+                round(total_tb, 3),
+                round(highres_bytes / 1e12, 3),
+                round(derivative_bytes / 1e12, 4),
+                full_res,
+                native_kept,
+                main_down,
+                secondary_down,
+                drop_low,
+                drop_cap,
+                *[derivative_counts[edge] for edge in policy.derivative_edges],
+                fits,
+            ]
+        )
 
     path = write_csv(
         reports / "budget_curve.csv",
-        ["top_n", "median_cap", "total_tb", "full_res_images", "downscaled_images", "dropped_images", "fits_budget"],
+        [
+            "top_n",
+            "quality",
+            "total_tb",
+            "highres_tb",
+            "derivative_tb",
+            "full_res_images",
+            "native_kept_images",
+            "main_downscaled_images",
+            "secondary_downscaled_images",
+            "low_quality_dropped",
+            "unit_cap_dropped",
+            *edge_labels,
+            "fits_budget",
+        ],
         rows,
     )
     print(f"\noutput: {path}")

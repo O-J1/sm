@@ -42,6 +42,7 @@ from .storage import RecordStore
 
 MAX_CONVERSION_PIXELS = 8_388_608
 DEFAULT_JXL_QUALITY = 95
+DEFAULT_DERIVATIVE_QUALITY = 90
 MAX_COMMAND_ERROR_OUTPUT = 8000
 METADATA_GROUP_ARGS = (
     "-EXIF:all",
@@ -83,6 +84,7 @@ class JxlConverter:
         skip_metadata: bool = False,
         timeout: float | None = None,
         progress: Callable[[str], None] | None = None,
+        magick_path: Path | None = None,
     ) -> None:
         self._cjxl_path = cjxl_path
         self._exiftool_path = exiftool_path
@@ -93,6 +95,7 @@ class JxlConverter:
         self._skip_metadata = skip_metadata
         self._timeout = timeout
         self._progress = progress
+        self._magick_path = magick_path
 
     def metadata_copy_command(self, source_path: Path, target_path: Path) -> list[str]:
         return [
@@ -110,13 +113,41 @@ class JxlConverter:
     def strip_icc_command(self, path: Path) -> list[str]:
         return [str(self._exiftool_path), "-ICC_Profile:all=", "-overwrite_original", _tool_path(path)]
 
-    def encode_command(self, source_path: Path, output_path: Path) -> list[str]:
+    def encode_command(self, source_path: Path, output_path: Path, quality: int | None = None) -> list[str]:
         verbose_args = ["-v"] * self._cjxl_verbose
-        return [str(self._cjxl_path), *verbose_args, _tool_path(source_path), _tool_path(output_path), "-q", str(self._quality)]
+        effective_quality = self._quality if quality is None else quality
+        return [str(self._cjxl_path), *verbose_args, _tool_path(source_path), _tool_path(output_path), "-q", str(effective_quality)]
+
+    def derivative_command(self, source_path: Path, output_path: Path, edge: int, quality: int) -> list[str]:
+        """ImageMagick Lanczos2Sharp resize to `edge` on the longest side
+        (aspect preserved, never upscaled) generated from the original file."""
+        if self._magick_path is None:
+            raise RuntimeError(
+                "derivative outputs require ImageMagick: set MAGICK_PATH or pass --magick-path "
+                "(user-space install, e.g. the extracted GitHub-release AppImage)"
+            )
+        return [
+            str(self._magick_path),
+            _tool_path(source_path),
+            "-filter",
+            "Lanczos2Sharp",
+            "-resize",
+            f"{edge}x{edge}>",
+            "-quality",
+            str(quality),
+            _tool_path(output_path),
+        ]
 
     async def convert_row(self, row: sqlite3.Row) -> tuple[Path, int]:
         source_path = Path(str(row["source_path"]))
-        output_path = self._store.conversion_path(source_path, f".{row['target_format']}")
+        output_kind = str(_row_value(row, "output_kind") or "highres")
+        planned_output = str(_row_value(row, "output_path") or "")
+        if output_kind != "highres":
+            return await self._convert_derivative(row, source_path, planned_output, output_kind)
+        if planned_output:
+            output_path = self._store.output_dir / Path(planned_output)
+        else:
+            output_path = self._store.conversion_path(source_path, f".{row['target_format']}")
         if output_path.exists() and output_path.stat().st_size > 0:
             self._log(f"conversion skipped existing output: {output_path} ({output_path.stat().st_size} bytes)")
             return output_path, output_path.stat().st_size
@@ -131,7 +162,9 @@ class JxlConverter:
         try:
             started_at = time.monotonic()
             self._log(f"conversion resize start: {source_path}")
-            self._write_resized_png(source_path, resized_path)
+            max_pixels = int(_row_value(row, "target_max_pixels") or self._max_pixels)
+            quality = _row_value(row, "quality")
+            self._write_resized_png(source_path, resized_path, max_pixels)
             self._log(f"conversion resize complete: {resized_path} ({resized_path.stat().st_size} bytes)")
             if self._skip_metadata:
                 self._log(f"conversion metadata copy skipped: {resized_path}")
@@ -146,7 +179,7 @@ class JxlConverter:
             icc_stripped = False
             try:
                 await _run_command(
-                    self.encode_command(resized_path.resolve(), part_path.resolve()),
+                    self.encode_command(resized_path.resolve(), part_path.resolve(), quality),
                     timeout=self._timeout,
                     cwd=part_path.parent.resolve(),
                 )
@@ -160,7 +193,7 @@ class JxlConverter:
                 try:
                     await _run_command(self.strip_icc_command(resized_path), timeout=self._timeout)
                     await _run_command(
-                        self.encode_command(resized_path.resolve(), part_path.resolve()),
+                        self.encode_command(resized_path.resolve(), part_path.resolve(), quality),
                         timeout=self._timeout,
                         cwd=part_path.parent.resolve(),
                     )
@@ -179,6 +212,7 @@ class JxlConverter:
                 self._log(f"conversion metadata verify start: {part_path}")
                 await self._verify_metadata(source_path, part_path, ignore_icc=icc_stripped)
                 self._log(f"conversion metadata verify complete: {part_path}")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(part_path, output_path)
             elapsed = time.monotonic() - started_at
             self._log(f"conversion complete: {output_path} ({output_path.stat().st_size} bytes, {elapsed:.1f}s)")
@@ -186,16 +220,61 @@ class JxlConverter:
         finally:
             _remove_paths(resized_path, part_path)
 
+    async def _convert_derivative(
+        self,
+        row: sqlite3.Row,
+        source_path: Path,
+        planned_output: str,
+        output_kind: str,
+    ) -> tuple[Path, int]:
+        """Produce a small Lanczos2Sharp pretraining resize from the ORIGINAL
+        source file (never from the downscaled highres output)."""
+        edge = int(_row_value(row, "target_edge") or 0)
+        if edge < 1:
+            raise RuntimeError(f"derivative row without target_edge: {row['resource_key']} ({output_kind})")
+        if planned_output:
+            output_path = self._store.output_dir / Path(planned_output)
+        else:
+            extension = str(_row_value(row, "output_format") or "jpg")
+            output_path = self._store.conversion_path(
+                source_path.with_name(f"{source_path.stem}_{edge}{source_path.suffix}"), f".{extension}"
+            )
+        if output_path.exists() and output_path.stat().st_size > 0:
+            self._log(f"derivative skipped existing output: {output_path} ({output_path.stat().st_size} bytes)")
+            return output_path, output_path.stat().st_size
+        if not source_path.exists():
+            raise FileNotFoundError(f"source image does not exist: {source_path}")
+        quality = int(_row_value(row, "quality") or DEFAULT_DERIVATIVE_QUALITY)
+        part_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _remove_paths(part_path)
+        try:
+            started_at = time.monotonic()
+            self._log(f"derivative start: {source_path} -> {output_path} ({edge}px)")
+            await _run_command(
+                self.derivative_command(source_path.resolve(), part_path.resolve(), edge, quality),
+                timeout=self._timeout,
+                cwd=part_path.parent.resolve(),
+            )
+            if not part_path.exists() or part_path.stat().st_size == 0:
+                raise RuntimeError("magick completed without producing a non-empty output")
+            os.replace(part_path, output_path)
+            elapsed = time.monotonic() - started_at
+            self._log(f"derivative complete: {output_path} ({output_path.stat().st_size} bytes, {elapsed:.1f}s)")
+            return output_path, output_path.stat().st_size
+        finally:
+            _remove_paths(part_path)
+
     def _log(self, message: str) -> None:
         if self._progress is not None:
             self._progress(message)
 
-    def _write_resized_png(self, source_path: Path, resized_path: Path) -> None:
+    def _write_resized_png(self, source_path: Path, resized_path: Path, max_pixels: int | None = None) -> None:
         image = cv2.imread(str(source_path), cv2.IMREAD_UNCHANGED)
         if image is None:
             raise RuntimeError(f"OpenCV could not read TIFF: {source_path}")
         height, width = image.shape[:2]
-        target_width, target_height = resize_dimensions(width, height, self._max_pixels)
+        target_width, target_height = resize_dimensions(width, height, max_pixels or self._max_pixels)
         if (target_width, target_height) != (width, height):
             image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
         resized_path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,6 +377,18 @@ def _normalize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _tool_path(path: Path) -> str:
     return path.as_posix() if os.name == "nt" else str(path)
+
+
+def _row_value(row, key: str, default=None):
+    """Tolerant column access for sqlite3.Row / mapping rows that may predate
+    the policy columns."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return default
+    if key not in keys:
+        return default
+    return row[key]
 
 
 def _resized_temp_path(source_path: Path) -> Path:
