@@ -11,6 +11,7 @@ from .api import SmithsonianClient
 from .config import ScraperConfig, build_config
 from .conversion import JxlConverter
 from .media import MediaDownloader
+from .reporting import write_failure_report
 from .scheduler import CrawlScheduler
 from .state import StateStore
 from .storage import RecordStore
@@ -31,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
             asyncio.run(_convert_media(config))
         elif args.command == "status":
             asyncio.run(_status(config))
+        elif args.command == "failure-report":
+            _failure_report(config, args.report_path)
         else:
             parser.print_help()
             return 2
@@ -271,6 +274,16 @@ async def _status(config: ScraperConfig) -> None:
         await state.close()
 
 
+def _failure_report(config: ScraperConfig, report_path: str | None) -> None:
+    output = Path(report_path) if report_path else config.output_dir / "failed_media.csv"
+    counts = write_failure_report(config.database_path, output)
+    total = sum(counts.values())
+    for stage in sorted(counts):
+        print(f"{stage}: {counts[stage]:,}")
+    print(f"total failures: {total:,}")
+    print(f"report written to: {output}")
+
+
 def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
     include_units = tuple(_split_csv(args.include_units))
     exclude_units = tuple(_split_csv(args.exclude_units))
@@ -306,7 +319,8 @@ def _config_from_args(args: argparse.Namespace) -> ScraperConfig:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="smithsonian-scraper")
-    parser.add_argument("command", choices=["probe", "scrape", "resume", "download-media", "convert-media", "status"])
+    parser.add_argument("command", choices=["probe", "scrape", "resume", "download-media", "convert-media", "status", "failure-report"])
+    parser.add_argument("--report-path", default=None, help="Output CSV for failure-report (default: <output-dir>/failed_media.csv).")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--output-dir", default="data")
     parser.add_argument("--database-path", default=None)

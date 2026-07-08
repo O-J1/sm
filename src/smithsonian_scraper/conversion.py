@@ -107,6 +107,9 @@ class JxlConverter:
     def metadata_json_command(self, path: Path) -> list[str]:
         return [str(self._exiftool_path), "-j", "-G1", "-s", *METADATA_GROUP_ARGS, _tool_path(path)]
 
+    def strip_icc_command(self, path: Path) -> list[str]:
+        return [str(self._exiftool_path), "-ICC_Profile:all=", "-overwrite_original", _tool_path(path)]
+
     def encode_command(self, source_path: Path, output_path: Path) -> list[str]:
         verbose_args = ["-v"] * self._cjxl_verbose
         return [str(self._cjxl_path), *verbose_args, _tool_path(source_path), _tool_path(output_path), "-q", str(self._quality)]
@@ -140,6 +143,7 @@ class JxlConverter:
                     raise RuntimeError(f"metadata copy failed for {resized_path}: {exc}") from exc
                 self._log(f"conversion metadata copy complete: {resized_path}")
             self._log(f"conversion cjxl start: {resized_path} -> {part_path}")
+            icc_stripped = False
             try:
                 await _run_command(
                     self.encode_command(resized_path.resolve(), part_path.resolve()),
@@ -147,7 +151,25 @@ class JxlConverter:
                     cwd=part_path.parent.resolve(),
                 )
             except Exception as exc:
-                raise RuntimeError(f"cjxl failed for {resized_path}: {exc}") from exc
+                if "JxlEncoderSetICCProfile" not in str(exc):
+                    raise RuntimeError(f"cjxl failed for {resized_path}: {exc}") from exc
+                # Corrupt or unsupported ICC profile. Strip it and retry once:
+                # pixels are unaffected, the image falls back to sRGB
+                # interpretation (which is all a broken profile provided anyway).
+                self._log(f"conversion cjxl ICC profile rejected; stripping and retrying: {resized_path}")
+                try:
+                    await _run_command(self.strip_icc_command(resized_path), timeout=self._timeout)
+                    await _run_command(
+                        self.encode_command(resized_path.resolve(), part_path.resolve()),
+                        timeout=self._timeout,
+                        cwd=part_path.parent.resolve(),
+                    )
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        f"cjxl failed for {resized_path} even after ICC strip: {retry_exc}"
+                    ) from retry_exc
+                icc_stripped = True
+                self._log(f"conversion recovered after ICC strip: {resized_path}")
             if not part_path.exists() or part_path.stat().st_size == 0:
                 raise RuntimeError("cjxl completed without producing a non-empty JXL")
             self._log(f"conversion cjxl complete: {part_path} ({part_path.stat().st_size} bytes)")
@@ -155,7 +177,7 @@ class JxlConverter:
                 self._log(f"conversion metadata verify skipped: {part_path}")
             else:
                 self._log(f"conversion metadata verify start: {part_path}")
-                await self._verify_metadata(source_path, part_path)
+                await self._verify_metadata(source_path, part_path, ignore_icc=icc_stripped)
                 self._log(f"conversion metadata verify complete: {part_path}")
             os.replace(part_path, output_path)
             elapsed = time.monotonic() - started_at
@@ -180,9 +202,12 @@ class JxlConverter:
         if not cv2.imwrite(str(resized_path), image):
             raise RuntimeError(f"OpenCV could not write resized PNG: {resized_path}")
 
-    async def _verify_metadata(self, source_path: Path, output_path: Path) -> None:
+    async def _verify_metadata(self, source_path: Path, output_path: Path, *, ignore_icc: bool = False) -> None:
         source_metadata = await self._selected_metadata(source_path)
         output_metadata = await self._selected_metadata(output_path)
+        if ignore_icc:
+            source_metadata = {k: v for k, v in source_metadata.items() if not k.startswith("ICC_Profile:")}
+            output_metadata = {k: v for k, v in output_metadata.items() if not k.startswith("ICC_Profile:")}
         if source_metadata != output_metadata:
             missing = sorted(set(source_metadata) - set(output_metadata))[:10]
             changed = sorted(key for key in source_metadata if key in output_metadata and source_metadata[key] != output_metadata[key])[:10]
