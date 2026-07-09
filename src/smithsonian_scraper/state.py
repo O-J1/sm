@@ -89,6 +89,8 @@ class StateStore:
         record: SmithsonianRecord,
         raw_path: Path,
         projection: NormalizedRecordProjection,
+        *,
+        commit: bool = True,
     ) -> bool:
         async with self._lock:
             existing = self._connection.execute(
@@ -100,8 +102,21 @@ class StateStore:
             self._upsert_record_row(record, raw_path)
             if projection_needs_replace:
                 self._replace_record_projection(record, raw_path, projection)
-            self._connection.commit()
+            if commit:
+                self._connection.commit()
             return raw_changed
+
+    async def has_raw_version(self, record_id: str, doc_signature: str) -> bool:
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM record_raw_versions WHERE record_id = ? AND doc_signature = ?",
+                (record_id, doc_signature),
+            ).fetchone()
+            return row is not None
+
+    async def commit(self) -> None:
+        async with self._lock:
+            self._connection.commit()
 
     async def upsert_partition(self, partition_key: str, query: str, row_count: int | None) -> None:
         async with self._lock:

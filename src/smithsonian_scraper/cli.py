@@ -305,7 +305,8 @@ async def _reproject(config: ScraperConfig) -> None:
     """Rebuild the normalized projection tables (media_items, media_resources,
     record_text_entries, ...) from the raw metadata JSONL files on disk.
     Use this to upgrade a metadata-only database created by an older version
-    of the scraper without re-hitting the API."""
+    of the scraper without re-hitting the API. Resumable: records whose
+    (id, docSignature) already have a stored raw version are skipped."""
     state = StateStore(config.database_path)
     await state.initialize()
     store = RecordStore(config.output_dir)
@@ -313,7 +314,9 @@ async def _reproject(config: ScraperConfig) -> None:
     if not paths:
         raise ValueError(f"no records.jsonl files found under {config.output_dir / 'metadata'}")
     processed = 0
+    skipped = 0
     failed = 0
+    pending_commit = 0
     try:
         for jsonl_path in paths:
             _print_progress(f"reprojecting {jsonl_path}")
@@ -323,23 +326,41 @@ async def _reproject(config: ScraperConfig) -> None:
                     if not line:
                         continue
                     raw = json.loads(line)
+                    record_id = str(raw.get("id", ""))
+                    doc_signature = str(raw.get("docSignature", ""))
+                    if record_id and doc_signature and await state.has_raw_version(record_id, doc_signature):
+                        skipped += 1
+                        if skipped % 100_000 == 0:
+                            _print_progress(f"skipped {skipped:,} already-projected records")
+                        continue
                     try:
                         record = parse_record(raw)
                         projection = normalize_record(record)
-                        await state.upsert_record_projection(record, store.record_path(record), projection)
+                        await state.upsert_record_projection(
+                            record, store.record_path(record), projection, commit=False
+                        )
                     except RecordParseError as exc:
                         failed += 1
                         await state.record_failure(
                             source="reproject",
-                            identifier=str(raw.get("id", "")),
+                            identifier=record_id,
                             payload=raw,
                             error=str(exc),
                         )
                         continue
                     processed += 1
+                    pending_commit += 1
+                    if pending_commit >= 2_000:
+                        await state.commit()
+                        pending_commit = 0
                     if processed % 10_000 == 0:
-                        _print_progress(f"reprojected {processed:,} records")
-        _print_progress(f"reproject complete: {processed:,} records, {failed:,} failures")
+                        _print_progress(f"reprojected {processed:,} records ({skipped:,} skipped)")
+            await state.commit()
+            pending_commit = 0
+        await state.commit()
+        _print_progress(
+            f"reproject complete: {processed:,} records, {skipped:,} skipped, {failed:,} failures"
+        )
         print(json.dumps(await state.status_counts(), indent=2, sort_keys=True))
     finally:
         await state.close()
