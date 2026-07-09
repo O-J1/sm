@@ -1070,6 +1070,8 @@ CREATE TABLE IF NOT EXISTS record_media (
     FOREIGN KEY (media_key) REFERENCES media_items(media_key) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_record_media_media_key ON record_media(media_key);
+
 CREATE TABLE IF NOT EXISTS media_resources (
     resource_key TEXT PRIMARY KEY,
     media_key TEXT NOT NULL,
@@ -1095,6 +1097,7 @@ CREATE TABLE IF NOT EXISTS media_resources (
 );
 
 CREATE INDEX IF NOT EXISTS idx_media_resources_media_key ON media_resources(media_key);
+CREATE INDEX IF NOT EXISTS idx_media_resources_record_id ON media_resources(record_id);
 CREATE INDEX IF NOT EXISTS idx_media_resources_role ON media_resources(role);
 CREATE INDEX IF NOT EXISTS idx_media_resources_preferred ON media_resources(preferred_download);
 CREATE INDEX IF NOT EXISTS idx_media_resources_status ON media_resources(status);
@@ -1111,6 +1114,7 @@ CREATE TABLE IF NOT EXISTS media_usage_codes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_media_usage_codes_code ON media_usage_codes(code);
+CREATE INDEX IF NOT EXISTS idx_media_usage_codes_record_id ON media_usage_codes(record_id);
 
 CREATE TABLE IF NOT EXISTS record_relationships (
     record_id TEXT NOT NULL,
